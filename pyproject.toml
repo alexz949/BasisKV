@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "basiskv"
+version = "0.1.0"
+description = "BasisKV compression, routing, and inference research code"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch", "safetensors"]
+
+[project.entry-points."vllm.general_plugins"]
+basiskv = "inference:register"
+
+[tool.setuptools.packages.find]
+include = ["core", "core.*", "calibration", "calibration.*", "kernels", "kernels.*", "benchmarks", "benchmarks.*", "inference", "inference.*", "eval", "eval.*", "appendix", "appendix.*", "others", "others.*"]
+
+[tool.setuptools.package-data]
+"kernels" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh", "csrc/*.h"]
+"others" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.cuh", "csrc/*.h"]
+"benchmarks" = ["README.md"]
+"appendix.tasks" = ["**/*.yaml", "**/*.json"]
+"eval.longbench_official" = ["*.json", "README.md"]

@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Build a two-sided factorized terminal-KL rank schedule for Qwen3-8B.
+
+The local post-ALS reconstruction curves are read from the existing rank
+banks.  One measured terminal-KL intervention per layer calibrates a scalar
+downstream sensitivity.  The resulting separable costs are allocated under
+the same exact average-rank budget as the source Global-KL experiment.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import shlex
+import sys
+from typing import Any, Mapping, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from others.metric_rank_allocation import MetricRankOption, allocate_metric_rank_exact
+
+
+FORMAT = "basisserve.c1.factorized_terminal_kl_schedule.v1"
+SOURCE_FORMAT = "basisserve.qwen3_8b.gqa_c1.layer_global_kl_allocation.v1"
+NUM_LAYERS = 36
+NUM_KV_HEADS = 8
+HEAD_DIM = 128
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def predict_factorized_costs(
+    local_errors: Sequence[Mapping[int, float]],
+    terminal_probe_deltas: Sequence[float],
+    *,
+    candidate_ranks: Sequence[int],
+    anchor_rank: int,
+    probe_rank: int,
+    exponent: float = 1.0,
+) -> tuple[tuple[dict[int, float], ...], tuple[float, ...]]:
+    """Predict per-layer terminal costs from one non-anchor terminal probe."""
+
+    ranks = tuple(sorted(map(int, candidate_ranks)))
+    if not ranks or len(ranks) != len(set(ranks)):
+        raise ValueError("candidate_ranks must be non-empty and unique")
+    if anchor_rank not in ranks or probe_rank not in ranks:
+        raise ValueError("anchor and probe ranks must be candidate ranks")
+    if probe_rank == anchor_rank:
+        raise ValueError("probe rank must differ from anchor rank")
+    if not math.isfinite(exponent) or exponent <= 0:
+        raise ValueError("exponent must be finite and positive")
+    if len(local_errors) != len(terminal_probe_deltas):
+        raise ValueError("local error and terminal probe layer counts differ")
+
+    predicted: list[dict[int, float]] = []
+    sensitivities: list[float] = []
+    for layer, (curve, observed_delta) in enumerate(
+        zip(local_errors, terminal_probe_deltas, strict=True)
+    ):
+        if set(map(int, curve)) != set(ranks):
+            raise ValueError(f"layer {layer} local error curve is incomplete")
+        checked = {int(rank): float(value) for rank, value in curve.items()}
+        if any(not math.isfinite(value) or value < 0 for value in checked.values()):
+            raise ValueError(f"layer {layer} local errors must be finite and nonnegative")
+        delta = float(observed_delta)
+        if not math.isfinite(delta):
+            raise ValueError(f"layer {layer} terminal probe delta is non-finite")
+        transformed = {
+            rank: checked[rank] ** exponent
+            for rank in ranks
+        }
+        denominator = transformed[probe_rank] - transformed[anchor_rank]
+        if denominator == 0:
+            raise ValueError(f"layer {layer} probe has zero local-error separation")
+        raw_sensitivity = delta / denominator
+        if not math.isfinite(raw_sensitivity):
+            raise ValueError(f"layer {layer} downstream sensitivity is non-finite")
+        sensitivity = max(0.0, raw_sensitivity)
+        sensitivities.append(sensitivity)
+        predicted.append(
+            {
+                rank: sensitivity
+                * (transformed[rank] - transformed[anchor_rank])
+                for rank in ranks
+            }
+        )
+    return tuple(predicted), tuple(sensitivities)
+
+
+def predict_two_sided_factorized_costs(
+    local_errors: Sequence[Mapping[int, float]],
+    compression_probe_deltas: Sequence[float],
+    expansion_probe_deltas: Sequence[float],
+    *,
+    candidate_ranks: Sequence[int],
+    anchor_rank: int,
+    compression_probe_rank: int,
+    expansion_probe_rank: int,
+    exponent: float = 1.0,
+) -> tuple[
+    tuple[dict[int, float], ...],
+    tuple[float, ...],
+    tuple[float, ...],
+]:
+    """Predict rank costs with separately measured compression/expansion slopes."""
+
+    ranks = tuple(sorted(map(int, candidate_ranks)))
+    assert ranks and len(ranks) == len(set(ranks))
+    assert compression_probe_rank < anchor_rank < expansion_probe_rank
+    assert {
+        compression_probe_rank,
+        anchor_rank,
+        expansion_probe_rank,
+    }.issubset(ranks)
+    assert math.isfinite(exponent) and exponent > 0
+    assert len(local_errors) == len(compression_probe_deltas)
+    assert len(local_errors) == len(expansion_probe_deltas)
+
+    predicted: list[dict[int, float]] = []
+    compression_sensitivities: list[float] = []
+    expansion_sensitivities: list[float] = []
+    for curve, compression_delta, expansion_delta in zip(
+        local_errors,
+        compression_probe_deltas,
+        expansion_probe_deltas,
+        strict=True,
+    ):
+        checked = {int(rank): float(value) for rank, value in curve.items()}
+        assert set(checked) == set(ranks)
+        assert all(
+            math.isfinite(value) and value >= 0 for value in checked.values()
+        )
+        assert math.isfinite(float(compression_delta))
+        assert math.isfinite(float(expansion_delta))
+        transformed = {rank: checked[rank] ** exponent for rank in ranks}
+        anchor_error = transformed[anchor_rank]
+        compression_denominator = (
+            transformed[compression_probe_rank] - anchor_error
+        )
+        expansion_denominator = transformed[expansion_probe_rank] - anchor_error
+        assert compression_denominator > 0
+        assert expansion_denominator < 0
+        compression_sensitivity = max(
+            0.0,
+            float(compression_delta) / compression_denominator,
+        )
+        expansion_sensitivity = max(
+            0.0,
+            float(expansion_delta) / expansion_denominator,
+        )
+        compression_sensitivities.append(compression_sensitivity)
+        expansion_sensitivities.append(expansion_sensitivity)
+        predicted.append(
+            {
+                rank: (
+                    compression_sensitivity
+                    if rank < anchor_rank
+                    else expansion_sensitivity
+                    if rank > anchor_rank
+                    else 0.0
+                )
+                * (transformed[rank] - anchor_error)
+                for rank in ranks
+            }
+        )
+    return (
+        tuple(predicted),
+        tuple(compression_sensitivities),
+        tuple(expansion_sensitivities),
+    )
+
+
+def allocate_layer_schedule(
+    costs: Sequence[Mapping[int, float]],
+    *,
+    candidate_ranks: Sequence[int],
+    anchor_rank: int,
+    target_average_rank: int,
+) -> tuple[tuple[int, ...], float]:
+    """Allocate one rank per layer at an exact average-rank budget."""
+
+    ranks = tuple(sorted(map(int, candidate_ranks)))
+    options = []
+    for layer, curve in enumerate(costs):
+        options.append(
+            tuple(
+                MetricRankOption(
+                    option_id=f"layer{layer:03d}_rank{rank}",
+                    source_family="factorized_terminal_kl",
+                    rank=rank,
+                    scalar_cost=float(curve[rank]),
+                    is_anchor=rank == anchor_rank,
+                )
+                for rank in ranks
+            )
+        )
+    allocation = allocate_metric_rank_exact(
+        options,
+        total_rank_budget=len(options) * target_average_rank,
+        anchor_rank=anchor_rank,
+    )
+    return (
+        tuple(option.rank for option in allocation.selected_options),
+        float(allocation.total_cost),
+    )
+
+
+def local_error_curves_from_factor_results(
+    factor_results: Mapping[int, Mapping[str, Any]],
+    *,
+    candidate_ranks: Sequence[int],
+    error_split: str = "heldout",
+    num_layers: int = NUM_LAYERS,
+    head_dim: int = HEAD_DIM,
+) -> tuple[dict[int, float], ...]:
+    """Read one post-ALS reconstruction-error curve per decoder layer."""
+
+    assert error_split in {"fit", "heldout"}
+    curves = [dict() for _ in range(num_layers)]
+    for rank in candidate_ranks:
+        if rank == head_dim:
+            for curve in curves:
+                curve[rank] = 0.0
+            continue
+        payload = factor_results.get(rank)
+        assert payload is not None
+        rows = payload.get("records", ())
+        assert len(rows) == num_layers
+        for layer, row in enumerate(rows):
+            configured_rank = int(row["fit_config"]["cache_rank_per_head"])
+            assert configured_rank == rank
+            metrics = row.get(error_split)
+            assert isinstance(metrics, Mapping)
+            curves[layer][rank] = float(metrics["factor_dtype_relative_mse"])
+    return tuple(curves)
+
+
+def _local_error_curves(
+    source: Mapping[str, Any],
+    *,
+    candidate_ranks: Sequence[int],
+    error_split: str,
+) -> tuple[dict[int, float], ...]:
+    factor_sources = source["factor_sources"]
+    factor_results = {}
+    for rank in candidate_ranks:
+        if rank == HEAD_DIM:
+            continue
+        record = factor_sources.get(str(rank))
+        if record is None:
+            raise ValueError(f"missing local factor source for rank {rank}")
+        directory = Path(record["path"]).expanduser().resolve()
+        result_path = directory / "results.json"
+        if _sha256(result_path) != record["results_sha256"]:
+            raise ValueError(f"local factor result hash mismatch for rank {rank}")
+        factor_results[rank] = json.loads(result_path.read_text(encoding="utf-8"))
+    return local_error_curves_from_factor_results(
+        factor_results,
+        candidate_ranks=candidate_ranks,
+        error_split=error_split,
+    )
+
+
+def _probe_deltas(
+    source: Mapping[str, Any],
+    *,
+    probe_rank: int,
+) -> tuple[float, ...]:
+    selected: dict[int, float] = {}
+    for row in source["profile"]["records"]:
+        if int(row["candidate_rank"]) != probe_rank:
+            continue
+        layer = int(row["layer"])
+        if layer in selected:
+            raise ValueError(f"duplicate probe record for layer {layer}")
+        selected[layer] = float(row["terminal_kl_delta"]["mean"])
+    if set(selected) != set(range(NUM_LAYERS)):
+        raise ValueError("terminal probe records do not cover every layer")
+    return tuple(selected[layer] for layer in range(NUM_LAYERS))
+
+
+def _accounting(layer_ranks: Sequence[int], *, anchor_rank: int) -> dict[str, Any]:
+    ranks = tuple(map(int, layer_ranks))
+    histogram = Counter(ranks)
+    source_rank_sum = NUM_KV_HEADS * sum(ranks)
+    return {
+        "layer_ranks": list(ranks),
+        "layer_rank_sum": sum(ranks),
+        "layer_rank_histogram": {
+            str(rank): count for rank, count in sorted(histogram.items())
+        },
+        "source_rank_sum": source_rank_sum,
+        "source_rank_histogram": {
+            str(rank): NUM_KV_HEADS * count
+            for rank, count in sorted(histogram.items())
+        },
+        "anchor_rank": anchor_rank,
+        "changed_layers_from_anchor": sum(rank != anchor_rank for rank in ranks),
+        "changed_sources_from_anchor": NUM_KV_HEADS
+        * sum(rank != anchor_rank for rank in ranks),
+        "dense_value_total_width": NUM_LAYERS * NUM_KV_HEADS * HEAD_DIM,
+        "dense_reduction": (NUM_LAYERS * NUM_KV_HEADS * HEAD_DIM)
+        / source_rank_sum,
+        "rectangular_collective_width_by_layer": [
+            NUM_KV_HEADS * rank for rank in ranks
+        ],
+        "rectangular_collective_total_width": source_rank_sum,
+        "uniform_anchor_total_width": NUM_LAYERS * NUM_KV_HEADS * anchor_rank,
+        "ragged_padding_overhead": 0.0,
+    }
+
+
+def build(args: argparse.Namespace) -> None:
+    source_path = args.allocation_result.expanduser().resolve()
+    output_path = args.output_json.expanduser().resolve()
+    if output_path.exists():
+        raise FileExistsError(output_path)
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    if source.get("format") != SOURCE_FORMAT or source.get("status") != "complete":
+        raise ValueError("source Global-KL allocation is incomplete or incompatible")
+    candidate_ranks = tuple(map(int, source["selection"]["candidate_ranks"]))
+    anchor_rank = int(source["profile"]["records"][0]["anchor_rank"])
+    if int(source["selection"]["target_layer_rank_sum"]) != NUM_LAYERS * anchor_rank:
+        raise ValueError("source Global-KL allocation has an unexpected rank budget")
+    local_errors = _local_error_curves(
+        source,
+        candidate_ranks=candidate_ranks,
+        error_split=args.local_error_split,
+    )
+    terminal_deltas = _probe_deltas(source, probe_rank=args.probe_rank)
+    costs, sensitivities = predict_factorized_costs(
+        local_errors,
+        terminal_deltas,
+        candidate_ranks=candidate_ranks,
+        anchor_rank=anchor_rank,
+        probe_rank=args.probe_rank,
+        exponent=args.exponent,
+    )
+    layer_ranks, predicted_cost = allocate_layer_schedule(
+        costs,
+        candidate_ranks=candidate_ranks,
+        anchor_rank=anchor_rank,
+        target_average_rank=args.target_average_rank,
+    )
+    schedule = [[rank] * NUM_KV_HEADS for rank in layer_ranks]
+    exponent_label = str(args.exponent).replace(".", "p")
+    schedule_name = f"factorized_a{exponent_label}_probe{args.probe_rank}"
+    full_schedule = tuple(
+        int(layer[0]) for layer in source["schedules"]["mean_dp"]["schedule"]
+    )
+    payload = {
+        "format": FORMAT,
+        "status": "complete",
+        "schedule_name": schedule_name,
+        "schedule": schedule,
+        "accounting": _accounting(layer_ranks, anchor_rank=anchor_rank),
+        "method": {
+            "name": "one_probe_factorized_terminal_kl",
+            "formula": (
+                "delta_K_lr = s_l * (e_lr^alpha - e_l_anchor^alpha)"
+            ),
+            "local_error": (
+                f"post-ALS factor-dtype {args.local_error_split} relative MSE"
+            ),
+            "local_error_split": args.local_error_split,
+            "anchor_rank": anchor_rank,
+            "probe_rank": args.probe_rank,
+            "terminal_interventions_per_layer": 1,
+            "exponent": args.exponent,
+            "predicted_additive_cost": predicted_cost,
+            "sensitivities": list(sensitivities),
+            "predicted_costs": [
+                {str(rank): curve[rank] for rank in candidate_ranks}
+                for curve in costs
+            ],
+        },
+        "diagnostics": {
+            "full_mean_dp_exact_layer_matches": sum(
+                left == right
+                for left, right in zip(layer_ranks, full_schedule, strict=True)
+            ),
+            "full_mean_dp_mean_absolute_rank_difference": sum(
+                abs(left - right)
+                for left, right in zip(layer_ranks, full_schedule, strict=True)
+            )
+            / NUM_LAYERS,
+            "full_mean_dp_layer_ranks": list(full_schedule),
+        },
+        "source": {
+            "allocation_result": str(source_path),
+            "allocation_result_sha256": _sha256(source_path),
+            "profile_dataset": source["profile"]["dataset"],
+            "profile_windows": source["profile"]["windows"],
+            "profile_sequence_length": source["profile"]["sequence_length"],
+        },
+        "command": shlex.join(sys.argv),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    _atomic_json(output_path, payload)
+    print(
+        f"[Two-Sided Factorized-KL] schedule={schedule_name} "
+        f"matches={payload['diagnostics']['full_mean_dp_exact_layer_matches']}/"
+        f"{NUM_LAYERS} output={output_path}",
+        flush=True,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allocation-result", type=Path, required=True)
+    parser.add_argument("--probe-rank", type=int, default=96)
+    parser.add_argument("--exponent", type=float, default=1.0)
+    parser.add_argument("--target-average-rank", type=int, required=True)
+    parser.add_argument(
+        "--local-error-split",
+        choices=("heldout", "fit"),
+        default="heldout",
+    )
+    parser.add_argument("--output-json", type=Path, required=True)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    build(parse_args())

@@ -1,0 +1,12 @@
+torch
+transformers==5.17.0
+safetensors
+datasets==5.0.0
+accelerate
+kernels==0.16.1
+lm-eval[ifeval]==0.4.11
+numpy
+scipy
+rouge
+jieba
+fuzzywuzzy

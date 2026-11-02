@@ -1,0 +1,96 @@
+"""Exact-K Page32 metadata and candidate-only register MMA routing."""
+from pathlib import Path
+import torch
+import triton as tr
+import triton.language as tl
+from others.register_router import compile_router
+
+
+@tr.jit
+def _summary(K, MN, MX, N:tl.constexpr, H:tl.constexpr, CAP:tl.constexpr,
+             S0:tl.constexpr,S1:tl.constexpr,S2:tl.constexpr):
+    row=tl.program_id(0);p=tl.program_id(1)
+    t=p*32+tl.arange(0,32);d=tl.arange(0,128)
+    x=tl.load(K+row//H*S0+row%H*S1+t[:,None]*S2+d[None,:],t[:,None]<N,other=0).to(tl.float32)
+    lo=tl.min(tl.where(t[:,None]<N,x,float('inf')),0)
+    hi=tl.max(tl.where(t[:,None]<N,x,-float('inf')),0)
+    tl.store(MN+(row*CAP+p)*128+d,lo);tl.store(MX+(row*CAP+p)*128+d,hi)
+
+
+@tr.jit
+def _advance(K,RING,MN,MX,H:tl.constexpr,CAP:tl.constexpr,POS,SLOT,
+             S0:tl.constexpr,S1:tl.constexpr):
+    row=tl.program_id(0);d=tl.arange(0,128)
+    addr=(row*64+SLOT)*128+d
+    old=tl.load(RING+addr).to(tl.float32)
+    off=(row*CAP+POS//32)*128+d
+    lo=tl.load(MN+off);hi=tl.load(MX+off)
+    tl.store(MN+off,tl.where(POS%32==0,old,tl.minimum(lo,old)))
+    tl.store(MX+off,tl.where(POS%32==0,old,tl.maximum(hi,old)))
+    new=tl.load(K+row//H*S0+row%H*S1+d)
+    tl.store(RING+addr,new)
+
+
+@tr.jit(do_not_specialize_on_alignment=["P", "N"])
+def _coarse(Q,MN,MX,U,H:tl.constexpr,CAP:tl.constexpr,P,N,
+            Q0:tl.constexpr,Q1:tl.constexpr):
+    head=tl.program_id(0);row=head//4
+    p=tl.program_id(1)*16+tl.arange(0,16);d=tl.arange(0,128)
+    q=tl.load(Q+row//H*Q0+(row%H*4+head%4)*Q1+d).to(tl.float32)
+    valid=(p<P)&(p*32<N)
+    lo=tl.load(MN+(row*CAP+p[:,None])*128+d[None,:],valid[:,None],other=0).to(tl.float32)
+    hi=tl.load(MX+(row*CAP+p[:,None])*128+d[None,:],valid[:,None],other=0).to(tl.float32)
+    x=tl.sum(tl.maximum(q[None,:]*lo,q[None,:]*hi),1)*0.08838834764831845
+    x+=tl.log(tl.minimum(32,tl.maximum(1,N-p*32)).to(tl.float32))
+    tl.store(U+head*P+p,tl.where(valid,x,-float('inf')),p<P)
+
+
+@tr.jit(do_not_specialize_on_alignment=["P", "TAIL"])
+def _group(U,G,P,TAIL,B:tl.constexpr):
+    row=tl.program_id(0);p=tl.arange(0,B);h=tl.arange(0,4)
+    x=tl.load(U+(row*4+h[:,None])*P+p[None,:],p[None,:]<P,other=-float('inf'))
+    eligible=(p>0)&(p<TAIL)&(p<P)
+    x=tl.where(eligible[None,:],x,-float('inf'))
+    m=tl.max(x,1);z=tl.log(tl.sum(tl.exp(x-m[:,None]),1))+m
+    score=tl.max(x-z[:,None],0)
+    fixed=(p==0)|(p>=TAIL)
+    tl.store(G+row*P+p,tl.where(fixed,float('inf'),score),p<P)
+
+
+class Metadata:
+    def __init__(self,k,capacity):
+        b,h,n,_=k.shape;self.h=h;self.n=n-64;self.cap=tr.cdiv(capacity,32)
+        self.minimum=torch.empty(b,h,self.cap,128,device=k.device,dtype=k.dtype)
+        self.maximum=torch.empty_like(self.minimum)
+        self.score_storage=torch.empty(b*h*4*self.cap,device=k.device,dtype=torch.float32)
+        pages=tr.cdiv(n,32)
+        self.score_output=self.score_storage[:b*h*4*pages].view(b,h,4,pages)
+        self.ring=k[:,:,-64:].contiguous().clone();self.slot=0
+        _summary[(b*h,tr.cdiv(self.n,32))](k,self.minimum,self.maximum,self.n,h,self.cap,*k.stride()[:3])
+    def advance(self,k):
+        _advance[(k.shape[0]*self.h,)](k,self.ring,self.minimum,self.maximum,self.h,self.cap,self.n,self.slot,*k.stride()[:2])
+        self.commit_advance()
+    def commit_advance(self):
+        self.n+=1;self.slot=(self.slot+1)%64
+    def scores(self,q):
+        """Return transient scores backed by the reusable decode workspace."""
+        p=tr.cdiv(self.n+64,32)
+        if self.score_output.shape[-1]!=p:
+            self.score_output=self.score_storage[:q.shape[0]*self.h*4*p].view(q.shape[0],self.h,4,p)
+        out=self.score_output
+        _coarse[(q.shape[0]*self.h*4,tr.cdiv(p,16))](q,self.minimum,self.maximum,out,self.h,self.cap,p,self.n,*q.stride()[:2])
+        return out
+
+
+def candidates(scores,historical):
+    b,h,_,p=scores.shape
+    if p<=512:return torch.arange(p,device=scores.device).expand(b,h,p).contiguous()
+    group=torch.empty(b,h,p,device=scores.device)
+    _group[(b*h,)](scores,group,p,historical//32,tr.next_power_of_2(p),num_warps=8)
+    return group.topk(512,dim=-1,sorted=False).indices.sort(dim=-1).values
+
+
+def compile_fine(root):
+    full = compile_router(root / 'full', rank=16, warps=8)
+    fine = compile_router(root / 'fine', rank=16, warps=8, indexed=True, value_dim=128)
+    return full, fine
