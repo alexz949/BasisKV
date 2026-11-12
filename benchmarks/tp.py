@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Figure 3: vLLM cohort throughput, TTFT, and TPOT (Qwen3 compact V64/V96)."""
+"""Figure 3: vLLM cohort throughput, TTFT, and TPOT for Llama and Qwen3 (dense, or compact V64/V96)."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ import sys
 import time
 
 from core.factor_io import write_json
-from inference.tp import load_manifest
-from inference import COMPACT_ARCHITECTURE, register
+from core.router_io import read_json
+from inference.tp import load_manifest, single_kv_head_layout
+from inference import COMPACT_ARCHITECTURES, register
 from benchmarks.common import distribution, prompts, arguments, command
 
 
@@ -74,17 +75,28 @@ def main():
     assert not result_path.exists(), f"Keep existing results: {result_path}"
     assert (args.value_factors is not None) == (args.arm == "basis"), "basis takes --value-factors; dense does not"
     source_prompts = prompts(args.tokens, max(args.batch_sizes), args.prefill_tokens).tolist()
+    # The adapter follows the checkpoint's own configuration; dense keeps the model's native vLLM architecture.
+    model_type = read_json(args.model.resolve() / "config.json")["model_type"]
+    layers, rank, overrides = None, None, {}
+    if args.arm == "basis":
+        root = args.value_factors.resolve()
+        fit = load_manifest(root)["fit_config"]
+        layers, rank = fit["geometry"]["num_layers"], fit["cache_rank_per_head"]
+        assert model_type in COMPACT_ARCHITECTURES and fit["geometry"]["model_type"] == model_type, (
+            f"compact Value serving covers {sorted(COMPACT_ARCHITECTURES)} checkpoints with factors fitted for the same model; "
+            f"got a {model_type} model and {fit['geometry']['model_type']} factors")
+        assert single_kv_head_layout(fit["geometry"], args.tp_size), (
+            "this benchmark admits prompts in chunks, which the compact path serves with one KV head and 4 or 8 query heads "
+            "per rank (TP 8 for Llama-3.1-8B and Qwen3-8B)")
+        overrides = {"architectures": [COMPACT_ARCHITECTURES[model_type]], "basisserve_c1_factor_dir": str(root),
+                     "basisserve_c1_validation": args.factor_validation}
     import torch
+    import transformers
+    import triton
     import vllm
     from vllm import LLM, SamplingParams
 
     register()
-    layers, overrides = None, {}
-    if args.arm == "basis":
-        root = args.value_factors.resolve()
-        layers = load_manifest(root)["fit_config"]["geometry"]["num_layers"]
-        overrides = {"architectures": [COMPACT_ARCHITECTURE], "basisserve_c1_factor_dir": str(root),
-                     "basisserve_c1_validation": args.factor_validation}
     configuration = dict(
         model=str(args.model.resolve()), tensor_parallel_size=args.tp_size, dtype="bfloat16",
         max_model_len=args.prefill_tokens+args.decode_tokens,
@@ -102,6 +114,7 @@ def main():
         schema="basiskv.benchmark.tp.v1", status="initializing", arm=args.arm, created_at=datetime.now(timezone.utc).isoformat(),
         command=shlex.join([sys.executable, *sys.argv]), conda_environment=os.environ.get("CONDA_DEFAULT_ENV", sys.prefix),
         torch=torch.__version__, torch_cuda=torch.version.cuda, vllm=vllm.__version__,
+        transformers=transformers.__version__, triton=triton.__version__, model_type=model_type,
         git_head=command(["git", "rev-parse", "HEAD"])["stdout"].strip(),
         git_status=command(["git", "status", "--short"])["stdout"],
         factor_validation=args.factor_validation, configuration=configuration,
@@ -122,6 +135,7 @@ def main():
     sampling = SamplingParams(temperature=0, max_tokens=args.decode_tokens, ignore_eos=True, detokenize=False)
     payload["status"] = "running"
     save()
+    compact_calls = [0] * args.tp_size
     for batch in args.batch_sizes:
         cohort = [{"prompt_token_ids": row} for row in source_prompts[:batch]]
         print(f"BENCH arm={args.arm} batch={batch} phase=warmup", flush=True)
@@ -140,8 +154,12 @@ def main():
                                   ttft_ms=measured["ttft_ms"], tpot_ms=measured["tpot_ms"])), flush=True)
         row["workers"] = llm.collective_rpc("basisserve_c1_statistics" if args.arm == "basis" else "basisserve_cuda_statistics")
         if args.arm == "basis":
-            assert all(worker["loaded_value_layers"] == layers and worker["capture_calls"] > 0
-                       for worker in row["workers"]), "a worker did not run the compressed path"
+            # Every rank loaded all factors, holds a cache whose Value width is the fitted rank, and executed
+            # the compact attention during this batch size (prefill always runs it eagerly).
+            assert all(worker["loaded_value_layers"] == layers and worker["cache_value_widths"] == [rank]
+                       and worker["compact_attention_calls"] > before
+                       for worker, before in zip(row["workers"], compact_calls, strict=True)), "a worker did not run the compact-Value path"
+            compact_calls = [worker["compact_attention_calls"] for worker in row["workers"]]
         save()
     # Keep CUPTI and trace export entirely after the timed sweep.
     for batch in args.profile_batches:

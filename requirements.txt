@@ -1,11 +1,12 @@
-torch
+# Calibration, fitting, Hugging Face inference and evaluation. Install the CUDA build of Torch first (see README).
+torch==2.13.0
 transformers==5.17.0
 safetensors
 datasets==5.0.0
 accelerate
 kernels==0.16.1
 lm-eval[ifeval]==0.4.11
-numpy
+numpy==2.3.5
 scipy
 rouge
 jieba

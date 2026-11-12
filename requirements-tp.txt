@@ -1,0 +1,5 @@
+# Tensor-parallel serving benchmark (benchmarks.tp), on top of requirements.txt.
+# The upstream vLLM 0.30.0 release wheel for CUDA 12.9 is used unmodified; it pins torch==2.13.0.
+-r requirements.txt
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl
+triton==3.7.1

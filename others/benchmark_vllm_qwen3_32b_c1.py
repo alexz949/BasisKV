@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.factor_io import sha256 as file_sha256  # noqa: E402
-from inference import DENSE_ARCHITECTURE, COMPACT_ARCHITECTURE
+from inference import DENSE_ARCHITECTURE, COMPACT_ARCHITECTURES
 
 
 ARMS = ("dense", "dense_diffkv_v128", "compact_v64")
@@ -210,7 +210,7 @@ def main() -> None:
     if args.arm == "compact_v64":
         assert factor_dir is not None
         hf_overrides = {
-            "architectures": [COMPACT_ARCHITECTURE],
+            "architectures": [COMPACT_ARCHITECTURES['qwen3']],
             "basisserve_c1_factor_dir": str(factor_dir),
             "basisserve_c1_result_sha256": args.result_sha256,
         }
@@ -320,7 +320,7 @@ def main() -> None:
             "model_architecture": (
                 DENSE_ARCHITECTURE
                 if args.arm == "dense_diffkv_v128"
-                else COMPACT_ARCHITECTURE
+                else COMPACT_ARCHITECTURES['qwen3']
                 if args.arm == "compact_v64"
                 else "Qwen3ForCausalLM"
             ),

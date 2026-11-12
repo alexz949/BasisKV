@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.factor_io import sha256 as file_sha256
 from inference.tp import load_manifest
-from inference import COMPACT_ARCHITECTURE, register
+from inference import COMPACT_ARCHITECTURES, register
 
 
 def distribution(values):
@@ -92,7 +92,7 @@ def main():
     sha = file_sha256(root / "results.json") if args.factor_validation == "sha256" else None
     manifest = load_manifest(root, sha, validation=args.factor_validation)
     layers = manifest["fit_config"]["num_hidden_layers"]
-    architecture = COMPACT_ARCHITECTURE
+    architecture = COMPACT_ARCHITECTURES['qwen3']
     if args.factor_validation == "sha256":
         assert file_sha256(args.model / "config.json") == manifest["fit_config"]["model_config_sha256"]
     model_config = json.loads((args.model / "config.json").read_text())

@@ -24,6 +24,11 @@ def head_slices(geometry, tp_rank, tp_size):
             slice(tp_rank * heads // tp_size, (tp_rank + 1) * heads // tp_size))
 
 
+def single_kv_head_layout(geometry, tp_size):
+    """Each rank holds one KV head and 4 or 8 query heads: the layout the DiffKV kernels and the prepared AllGather serve."""
+    return geometry['num_kv_heads'] == tp_size and geometry['num_heads'] // tp_size in (4, 8)
+
+
 def load_layer(root, manifest, layer, tp_rank, *, tp_size, device, dtype, validation='sha256'):
     root = Path(root)
     fit = manifest['fit_config']

@@ -1,4 +1,4 @@
-"""Config-driven Qwen3 TP adapters and the Qwen3.5 quality adapter for vLLM."""
+"""Config-driven Llama and Qwen3 TP adapters and the Qwen3.5 quality adapter for vLLM."""
 
 from pathlib import Path
 from typing import Any
@@ -9,14 +9,15 @@ from vllm.distributed import get_pp_group, get_tp_group, get_tensor_model_parall
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from inference.backends import c1_diffkv_backend, paged_backend
 from inference.qwen35 import Qwen35PrivateAGOutput, load_bank
-from inference.tp import folded_projection_weights, fold_value_weight, head_slices, load_layer, load_manifest
+from core.model_layout import ValueGeometry
+from inference.tp import folded_projection_weights, fold_value_weight, head_slices, load_layer, load_manifest, single_kv_head_layout
 from kernels.allgather import AllGather
 
 def check_supported(vllm_config, *, single_gpu=False):
@@ -35,9 +36,11 @@ def factor_configuration(vllm_config):
     check_supported(vllm_config)
     root = Path(config.basisserve_c1_factor_dir).expanduser().resolve()
     validation = getattr(config, 'basisserve_c1_validation', 'sha256')
-    manifest = load_manifest(root, validation=validation)
-    assert config.model_type == 'qwen3', 'the compressed adapter is written for Qwen3'
-    head_slices(manifest['fit_config']['geometry'], group.rank_in_group, group.world_size)
+    manifest = load_manifest(root)
+    geometry = manifest['fit_config']['geometry']
+    assert ValueGeometry.from_config(config, range(config.num_hidden_layers)).to_dict() == geometry, (
+        f'the Value factors in {root} were fitted for another model geometry')
+    head_slices(geometry, group.rank_in_group, group.world_size)
     return root, manifest, validation
 
 
@@ -74,8 +77,16 @@ class C1QKVParallelLinear(QKVParallelLinear):
 
 
 class C1Attention(nn.Module):
+    """Compact-Value attention of one TP rank, built from the native Llama or Qwen3 attention.
+
+    Both models keep their own rotary module. Qwen3 normalizes Q and K per head before RoPE; Llama
+    has no such norms. The Value encoder is folded into the V projection and the fitted decoder
+    replaces the dense output projection, so neither projection may carry a bias.
+    """
+
     def __init__(self, native, encoder, decoder, boundary, config):
         super().__init__()
+        assert native.qkv_proj.bias is None and native.o_proj.bias is None, 'the compact adapter folds bias-free V and output projections'
         self.num_heads, self.num_kv_heads = native.num_heads, native.num_kv_heads
         self.head_dim, self.value_rank = encoder.shape[-2:]
         self.boundary = boundary
@@ -84,7 +95,9 @@ class C1Attention(nn.Module):
         hf = config.model_config.hf_config
         self.qkv_proj = C1QKVParallelLinear(encoder, name[:-5] + '.qkv_proj',
                                           hf.hidden_size, hf.num_attention_heads, hf.num_key_value_heads)
-        self.q_norm, self.k_norm, self.rotary_emb = native.q_norm, native.k_norm, native.rotary_emb
+        self.q_norm, self.k_norm = (native.q_norm, native.k_norm) if hf.model_type == 'qwen3' else (nn.Identity(), nn.Identity())
+        self.rotary_emb = native.rotary_emb
+        self.calls = 0  # Python-level executions: every eager step and each CUDA Graph capture
         backend = c1_diffkv_backend(self.value_rank) if boundary is not None else paged_backend(self.value_rank)
         self.attn = Attention(self.num_heads, self.head_dim, native.scaling, num_kv_heads=self.num_kv_heads,
             cache_config=config.cache_config, prefix=name, attn_backend=backend, head_size_v=self.value_rank)
@@ -93,6 +106,7 @@ class C1Attention(nn.Module):
             object.__setattr__(self.attn, '_basisserve_c1_output', boundary)
 
     def forward(self, positions, hidden_states):
+        self.calls += 1
         qkv, _ = self.qkv_proj(hidden_states)
         qsize, ksize = self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim
         q, k, v = qkv.split((qsize, ksize, self.num_kv_heads * self.value_rank), dim=-1)
@@ -106,40 +120,62 @@ class C1Attention(nn.Module):
         return tensor_model_parallel_all_gather(local, dim=-1) @ self.decoder
 
 
-class BasisKVQwen3ForCausalLM(Qwen3ForCausalLM):
+class CompactValueModel:
+    """Compact-Value construction shared by the Llama and Qwen3 adapters.
+
+    The native vLLM class, next in the MRO, builds the embeddings, norms, MLPs, and LM head and loads
+    their weights. This mixin replaces every attention layer with C1Attention and keeps the dense
+    output projections out of the checkpoint stream; the fitted decoders stand in for them.
+    """
+
+    model_type = None
+
     def __init__(self, *, vllm_config, prefix=''):
-        root, manifest, validation = factor_configuration(vllm_config)
         config = vllm_config.model_config.hf_config
+        assert config.model_type == self.model_type, f'{type(self).__name__} serves {self.model_type} checkpoints, not {config.model_type}'
+        root, manifest, validation = factor_configuration(vllm_config)
         group = get_tp_group()
+        geometry = manifest['fit_config']['geometry']
         rank = manifest['fit_config']['cache_rank_per_head']
-        assert config.head_dim == 128 and rank in (64, 96), 'the DiffKV kernels are compiled for head_dim 128 and Value ranks 64 and 96'
+        prepared = single_kv_head_layout(geometry, group.world_size)
+        assert prepared or not vllm_config.scheduler_config.enable_chunked_prefill, (
+            'chunked prefill needs the DiffKV kernels, which serve one KV head and 4 or 8 query heads per rank; '
+            'disable chunked prefill for this tensor-parallel size')
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         device = next(self.parameters()).device
-        local_heads = config.num_attention_heads // group.world_size
-        use_prepared = config.num_key_value_heads == group.world_size and local_heads in (4, 8)
-        self.c1_boundary = PreparedC1Output(group.device_group, device, local_heads * rank,
-            vllm_config.scheduler_config.max_num_batched_tokens) if use_prepared else None
+        self.c1_boundary = PreparedC1Output(group.device_group, device, geometry['num_heads'] // group.world_size * rank,
+            vllm_config.scheduler_config.max_num_batched_tokens) if prepared else None
         for index, layer in enumerate(self.model.layers):
             encoder, decoder = load_layer(root, manifest, index, group.rank_in_group, tp_size=group.world_size,
                 device=device, dtype=torch.bfloat16, validation=validation)
             layer.self_attn = C1Attention(layer.self_attn, encoder, decoder, self.c1_boundary, vllm_config)
 
     def load_weights(self, weights):
-        skips = [f'model.layers.{layer}.self_attn.o_proj.' for layer in range(self.config.num_hidden_layers)]
-        if self.config.tie_word_embeddings:
-            skips.append('lm_head.')
-        return AutoWeightsLoader(self).load_weights((name, tensor) for name, tensor in weights
-                                                   if not name.startswith(tuple(skips)))
+        dense_outputs = tuple(f'model.layers.{layer}.self_attn.o_proj.' for layer in range(self.config.num_hidden_layers))
+        return super().load_weights((name, tensor) for name, tensor in weights if not name.startswith(dense_outputs))
 
     def c1_statistics(self):
-        attention = self.model.layers[0].self_attn
+        attentions = [layer.self_attn for layer in self.model.layers]
+        attention = attentions[0]
         stats = self.c1_boundary.statistics() if self.c1_boundary is not None else dict(backend='vllm_allgather', decoder_gemms=1)
-        return stats | dict(loaded_value_layers=sum(layer.self_attn.qkv_proj.value_loaded for layer in self.model.layers),
+        # Widths of the cache tensors vLLM bound to the layers, not of the configuration that requested them.
+        widths = sorted({int(layer.attn.kv_cache.shape[-1]) - layer.head_dim for layer in attentions})
+        return stats | dict(model_type=self.model_type, loaded_value_layers=sum(layer.qkv_proj.value_loaded for layer in attentions),
+            compact_attention_calls=sum(layer.calls for layer in attentions),
+            kv_cache_shape=list(attention.attn.kv_cache.shape), cache_value_widths=widths,
             attention_backend=attention.attn.attn_backend.get_name(), attention_impl=type(attention.attn.impl).__name__,
             prefill_specialization=f'qk{attention.head_dim}_v{attention.value_rank}',
             decode_specialization=f'qk{attention.head_dim}_v{attention.value_rank}_h{attention.num_heads}',
             decode_output_layout='feature_major_allgather_slot' if self.c1_boundary is not None else 'token_major',
             key_head_size=attention.head_dim, value_head_size=attention.value_rank)
+
+
+class BasisKVLlamaForCausalLM(CompactValueModel, LlamaForCausalLM):
+    model_type = 'llama'
+
+
+class BasisKVQwen3ForCausalLM(CompactValueModel, Qwen3ForCausalLM):
+    model_type = 'qwen3'
 
 
 class BasisKVFoldedQwen3ForCausalLM(Qwen3ForCausalLM):

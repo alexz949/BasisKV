@@ -6,18 +6,37 @@ routing, inference kernels, and quality and performance evaluation code.
 
 ## Installation
 
-Use Python 3.10+ with a CUDA-enabled PyTorch installation.
+One environment is supported: Python 3.11, PyTorch 2.13.0 built for CUDA 12.9,
+Transformers 5.17.0, Triton 3.7.1. Calibration, fitting, Hugging Face inference,
+and evaluation need only the base layer:
 
 ```bash
 git clone https://github.com/alexz949/BasisKV.git
 cd BasisKV
-pip install -r requirements.txt
+conda create -y -n basiskv -c conda-forge python=3.11
+conda activate basiskv
+pip install uv
+uv pip install torch==2.13.0 --torch-backend=cu129   # the CUDA 12.9 wheel; installed first so nothing replaces it
+uv pip install -r requirements.txt
 pip install -e . --no-deps
 ```
 
-CUDA extensions compile on first use and require a compatible CUDA toolkit;
-communication kernels also require NCCL development files. vLLM benchmarks
-require the paper runtime's DiffKV interfaces; see [benchmark setup](benchmarks/README.md).
+The tensor-parallel serving benchmark (`benchmarks.tp`) adds vLLM. It runs on the
+unmodified upstream vLLM 0.30.0 release wheel for CUDA 12.9, which provides the
+independent Key/Value head widths (DiffKV), the paused-admission scheduling
+calls, and the request timestamps the benchmark uses:
+
+```bash
+uv pip install -r requirements-tp.txt --torch-backend=cu129
+```
+
+`requirements-tp.txt` keeps the Torch build of the base layer (vLLM pins
+`torch==2.13.0`). Run the commands inside the activated environment.
+
+CUDA kernels require a CUDA 12.9 toolkit and a host C++17 compiler. See
+[CUDA setup and troubleshooting](benchmarks/README.md#cuda-setup) for the toolkit
+installer, and [CPU verification](benchmarks/README.md#verification) for the
+compact-Value adapter test (requires the vLLM dependencies above).
 
 ## Quick Start
 
