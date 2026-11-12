@@ -46,7 +46,7 @@ def write_manifest(args, geometry, layers, split_ids):
 @torch.inference_mode()
 def capture(args, windows, split_ids):
     model, _, geometry, attention, _ = load_teacher(args)
-    assert geometry.model_type != "qwen3_5", "Qwen3.5 Value banks come from the gated-V objective kept in others/"
+    assert geometry.model_type != "qwen3_5", "Qwen3.5 requires separately fitted gated-Value banks"
     ids = {split: values[args.window_shard_index :: args.window_shard_count] for split, values in split_ids.items()}
     width = geometry.num_heads * geometry.head_dim
     grams = {layer: {} for layer in attention}

@@ -61,12 +61,14 @@ router. Record fingerprints are retained in the output.
 
 Use `--method full` and omit `--router` for the Full-K control on the same Value
 checkpoint. Omitting Value factors as well evaluates the original dense model.
-The generic main runners implement Full-K and BasisKV; archived sparse-baseline
-drivers remain in `others/` with their original dependencies and protocols.
+The generic main runners implement Full-K and BasisKV.
 
-RULER reads `<task>/validation.jsonl` and a seed-42 `manifest.json` with source
-hashes and tokenizer identity. The official preparation helper is preserved at
-`others/prepare_qwen3_ruler_v1.py`. LongBench reads the original `<task>.jsonl`
+RULER takes externally prepared seed-42 data in `<task>/validation.jsonl`.
+Each record contains `input`, `outputs` (a list of reference answers), and an
+optional `answer_prefix`. The data directory must also contain `manifest.json`
+with `status: "complete"` and `protocol.sequence_length` matching the evaluation
+length; retain the source hashes and tokenizer identity in that manifest.
+LongBench reads the original `<task>.jsonl`
 files and uses the vendored official prompts, generation caps, and metrics.
 The nine tasks are `narrativeqa`, `multifieldqa_en`, `hotpotqa`, `musique`,
 `dureader`, `gov_report`, `samsum`, `passage_retrieval_en`, and `lcc`.
@@ -89,9 +91,8 @@ complete summary. Both task scores and the unweighted task mean are saved in
 
 ## Appendix and verification
 
-Appendix-specific drivers, reports, and task definitions live in
-[`../appendix/`](../appendix/README.md). Older model-specific runners and pilots live
-in `others/` with their experiment-specific defaults.
+Appendix-specific drivers and task definitions live in
+[`../appendix/`](../appendix/README.md).
 
 The release smoke checks use small CPU models and simulated input data.
 Run substantial evaluations through the scheduler.

@@ -194,5 +194,3 @@ No profiler runs during its primary timing.
 `attention.py` is the shared HF runtime; `timing.py`, `common.py`, and
 `numa_memory.py` provide the remaining helpers. Its CUDA extensions come from
 `kernels.decode`.
-Historical per-model drivers, microbenchmarks, two-stage routing experiments,
-Ampere preparation, and frozen-source baseline launchers live in `others/`.

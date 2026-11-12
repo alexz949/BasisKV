@@ -10,9 +10,10 @@ One environment is supported: Python 3.11, PyTorch 2.13.0 built for CUDA 12.9,
 Transformers 5.17.0, Triton 3.7.1. Calibration, fitting, Hugging Face inference,
 and evaluation need only the base layer:
 
+Download and extract the source ZIP from the anonymous repository. Run the
+following commands in the extracted directory containing `pyproject.toml`:
+
 ```bash
-git clone https://github.com/alexz949/BasisKV.git
-cd BasisKV
 conda create -y -n basiskv -c conda-forge python=3.11
 conda activate basiskv
 pip install uv
@@ -123,8 +124,8 @@ kernels/       CUDA and Triton attention, routing, and communication
 eval/          Quality evaluation
 appendix/      Appendix experiments
 benchmarks/    Throughput, latency, and memory measurements
-others/        Historical experiments and baselines
+tests/         Compact tensor-parallel adapter verification
 ```
 
-Historical scripts in `others/` may require external baseline code and local
-model/data paths. Experiment outputs and checkpoints are not bundled.
+Model weights, datasets, fitted factors, and experiment outputs are supplied
+separately. The commands above generate calibration windows and fitted factors.

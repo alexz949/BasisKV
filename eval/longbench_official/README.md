@@ -1,7 +1,7 @@
 # Official LongBench-v1 files (verbatim)
 
 Verbatim copies from the upstream LongBench repository, used by
-`eval/longbench_metrics.py` and `others/prepare_longbench_shadowkv9.py`.
+`eval/longbench_metrics.py` and `eval/longbench.py`.
 Do not edit them; scores are only comparable to published numbers while these
 files match upstream byte for byte.
 
