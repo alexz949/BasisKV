@@ -91,7 +91,7 @@ class ReferenceAttention(nn.Module):
 
 
 class ConcatenatingBoundary:
-    """Stands in for PreparedC1Output: same call contract, concatenation instead of the NCCL arena."""
+    """Emulate PreparedC1Output with in-process concatenation and the same call contract."""
 
     def __init__(self, group, device, local_width, max_tokens):
         self.local_width = local_width
@@ -149,7 +149,7 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
         real = attention.attn
         local_kv = attention.num_kv_heads
         assert attention.qkv_proj.value_loaded and real.head_size_v == rank
-        # The cache the real backend would allocate holds a compact Value, not a padded or dense one.
+        # Check the compact Value width in the backend cache layout.
         assert real.attn_backend.get_kv_cache_shape(4, 16, local_kv, HEAD_DIM) == (4, 16, local_kv, HEAD_DIM + rank)
         assert attention.qkv_proj.weight.shape[0] == (attention.num_heads + local_kv) * HEAD_DIM + local_kv * rank
         reference = ReferenceAttention(real)

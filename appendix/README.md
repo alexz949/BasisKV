@@ -3,8 +3,7 @@
 One entrypoint per appendix table or figure. Everything else runs through the
 main pipeline (`calibration.windows`, `calibration.value`, `calibration.router`, `core.fit_value`, `core.allocate`,
 `core.fit_router`, `eval.*`) with the settings listed below. Run from the
-`BasisKV/` root. Baseline methods (PaLU, Loki, ShadowKV, LRQK) are not part of
-this release; the rows below are the Dense and BasisKV rows of each table.
+`BasisKV/` root. The entries below cover the Dense and BasisKV rows of each table.
 
 | Result | Code |
 | --- | --- |

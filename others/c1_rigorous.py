@@ -1,15 +1,12 @@
 """Canonical representation controls for rigorous C1 experiments.
 
-The helpers in this module are deliberately offline and model-agnostic.  They
-define the two representations that must be compared before introducing a
-distributed runtime:
+These offline, model-agnostic helpers compare two collective representations:
 
     LR-AllReduce:  (sum_p Z_p F_p) D
     C1-AllGather:   sum_p (Z_p E_p) D_p
 
 The LR-AllReduce fitter solves the globally optimal activation-weighted
-rank-constrained output projection.  It is therefore a strong shared-decoder
-control rather than a deliberately weak baseline.
+rank-constrained output projection with a shared decoder.
 """
 
 from __future__ import annotations

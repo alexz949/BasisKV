@@ -158,7 +158,7 @@ class CompactValueModel:
         attentions = [layer.self_attn for layer in self.model.layers]
         attention = attentions[0]
         stats = self.c1_boundary.statistics() if self.c1_boundary is not None else dict(backend='vllm_allgather', decoder_gemms=1)
-        # Widths of the cache tensors vLLM bound to the layers, not of the configuration that requested them.
+        # Read Value widths from the KV cache tensors allocated by vLLM.
         widths = sorted({int(layer.attn.kv_cache.shape[-1]) - layer.head_dim for layer in attentions})
         return stats | dict(model_type=self.model_type, loaded_value_layers=sum(layer.qkv_proj.value_loaded for layer in attentions),
             compact_attention_calls=sum(layer.calls for layer in attentions),
@@ -225,8 +225,8 @@ class PreparedC1Output:
     """One communicator shared by sequential attention layers.
 
     Plans are warmed on the actual capture stream before capture begins.
-    Returning the GEMM result instead of the mutable arena also gives the
-    custom operator an ordinary, non-aliasing output contract for compilation.
+    The custom operator returns a separate GEMM output tensor, preserving
+    its non-aliasing output contract for compilation.
     """
 
     def __init__(self, group, device, local_width: int, max_tokens: int):

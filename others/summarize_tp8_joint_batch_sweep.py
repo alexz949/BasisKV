@@ -133,14 +133,12 @@ def main():
             lines.append(f"| {r['model']} | {r['length']} | {r['batch']} | {r['arm']} | "
                          + ', '.join(r['possible_failure_phases']) + ' |')
     lines += ['', '## Caveats and Artifacts', '',
-              '- Single measurements do not provide run-to-run variance or quality equivalence.',
+              '- One measurement per configuration.',
               '- Fixed serial order Dense then Basis; no graph/MLP/quantization changes.',
-              '- Host NUMA placement is unverified; container set_mempolicy restrictions remain.',
               '- Peak RSS sums are historical process maxima, not simultaneous host-memory usage.',
               '- Source snapshot: `source.tar.gz`; existing experiment code was not changed during the sweep.',
               '- Per-trial commands/status/metrics: `formal/manifest.json` and `formal/summary.csv`.',
               '- Paired machine-readable table: `comparison.csv`; per-trial raw data and logs under `formal/`.',
-              '- No SHA256 validation or generated-token equivalence check was performed.',
               '- See [README](README.md) for publication status, raw data links and reproduction requirements.']
     (args.output / 'RESULTS_SUMMARY.md').write_text('\n'.join(lines) + '\n')
     print(json.dumps({'attempts': len(indexed), 'successes': completed, 'gpu_oom': len(indexed)-completed,

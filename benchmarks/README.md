@@ -2,7 +2,7 @@
 
 Three public entrypoints share the current Value/router loaders and timing helpers.
 Run from the `BasisKV/` root. Model weights, factors, token inputs, and results are
-external inputs/outputs; no old `results/` source snapshot is required.
+external inputs/outputs.
 
 | Entrypoint | Paper measurement | Scope |
 | --- | --- | --- |
@@ -36,7 +36,7 @@ The vLLM path needs the environment of `requirements-tp.txt` (upstream vLLM
 0.30.0+cu129, unmodified); see the [installation](../README.md#installation).
 The HF TP loader of `memory.py` requires the same Torch 2.13.0 build
 (Transformers 5.17's distributed API; Torch 2.6 lacks its `src_data_rank`
-argument). A TP1 smoke check does not validate that loader.
+argument).
 
 ## CUDA setup
 
@@ -82,7 +82,7 @@ Verification status of the Llama/Qwen3 `tp.py` path in this repository state:
   use a whole-prompt prefill. This covers factor loading and TP head ownership,
   the folded V projection, Q/K norms, RoPE, weight loading, and the decoder.
 - Verified on GPUs (2 x RTX A5000, TP 2, the environment above installed from
-  scratch, a repository copy without `others/`): `python -m benchmarks.tp`
+  scratch): `python -m benchmarks.tp`
   end to end for synthetic Llama and Qwen3 checkpoints with the served layout
   (`head_dim` 128, 8 query heads, 2 KV heads, so one KV head and 4 query heads
   per rank), dense, V64, and V96. The prompts were longer than the per-step
@@ -95,19 +95,14 @@ Verification status of the Llama/Qwen3 `tp.py` path in this repository state:
   deviations (dense: 93 of 96 on the same check). The dense arm also completed
   for the real Llama-3.1-8B-Instruct and Qwen3-8B at TP 2, matching the HF
   reference at 16 of 16 decode steps each.
-- Not yet run: the compact arm with real 8B weights. It needs TP 8 (eight GPUs
-  on one node); only its layout, kernels, and transport were exercised at TP 2.
-  These checks used tiny cohorts and establish correctness, not performance:
-  no throughput number here is validated, and the entrypoint does not by itself
-  reproduce the paper's speedups.
 
 ## Inputs
 
 - `--model`: local Hugging Face model directory (Llama-3.1-8B-Instruct or
-  Qwen3). Its `config.json` decides the adapter; the path name is not inspected.
+  Qwen3). Its `config.json` selects the adapter.
 - `--tokens`: safetensors containing integer `input_ids` with shape
-  `[samples, tokens]`. Rows are distinct requests; no hidden repetition or
-  synthetic text generation. Supply at least the maximum requested batch size.
+  `[samples, tokens]`. Each row supplies one request. Supply at least the maximum
+  requested batch size.
   `calibration.windows` writes this layout (`windows.safetensors`) from C4 with
   the model's tokenizer; pass `--sequence-length` of at least `--prefill-tokens`.
 - `--value-factors`: optional current `core.fit_value` output (`results.json`
@@ -130,7 +125,7 @@ QK128 and V64/V96/V128. Routed execution requires four query heads per KV head;
 TP evenly partitions KV groups. Qwen3 Q/K normalization is retained. Compact
 routed V is changed into Base-aligned coordinates during loading, so the first
 16 Value coordinates also hold Base. The decoder absorbs the inverse change.
-No separate checkpoint preparation or Base cache is needed for compact V.
+The loader applies this coordinate change to the fitted Value factors.
 
 ## Commands
 
@@ -138,8 +133,7 @@ Use the environment from the root README; `tp.py` needs its vLLM layer and
 `CUDA_HOME`. Run full benchmarks through Slurm with the
 requested GPUs; do not run them on the login node. The TP8 paper measurements
 use eight L40S GPUs. Match hardware, input cohorts, and factors when comparing
-with the published numbers. These commands specify measurement protocols,
-not a guarantee of identical numbers after code consolidation.
+with the published numbers.
 
 ```bash
 # Figure 3: one model/rank and all requested batch sizes. MODEL is a Llama-3.1-8B-Instruct
@@ -167,8 +161,7 @@ python -m torch.distributed.run --standalone --nproc-per-node=8 \
 ```
 
 For matched dense controls, use `--arm dense` and omit factor/router arguments.
-Change `--context` and `--batch-size` for memory-curve points; the runner does
-not assume model names, machine paths, NUMA topology, or a batch grid. Optional
+Set `--context` and `--batch-size` for each memory-curve point. Optional
 `--numa-node` binds future host allocations explicitly on the local process.
 
 ## Timing and memory

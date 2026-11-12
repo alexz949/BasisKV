@@ -1,6 +1,6 @@
 """Table 5: WikiText-2 training windows in the format of `calibration.windows`.
 
-WikiText-2 articles are short, so instead of one excerpt per document the train
+To pack the short WikiText-2 articles into fixed-length windows, the train
 split is joined with blank lines, tokenized once, and cut into contiguous
 windows. The output feeds `calibration.value` unchanged.
 

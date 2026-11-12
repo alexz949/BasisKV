@@ -143,8 +143,7 @@ def fit_activation_aware_wo_factors(
     last_info = -1
     # Large FP32 streaming Grams can acquire tiny negative eigenvalues through
     # accumulation roundoff.  Use the smallest decade of diagonal jitter that
-    # restores positive definiteness instead of silently selecting a large
-    # fixed regularizer for every layer.
+    # restores positive definiteness for each layer.
     for _ in range(6):
         regularized = matrix.clone()
         regularized.diagonal().add_(damping_tensor)

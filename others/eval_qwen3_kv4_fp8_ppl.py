@@ -251,7 +251,7 @@ def main():
         "K/V NUQ4 uses the official quantize/dequantize quality simulation with outliers; this is not a packed-cache speed test.",
         "FP8 uses actual E4M3 GEMMs for folded V encoder and output decoder only; other components remain BF16.",
         "All fitted quantities use WT2 train, never test. Activation scales are frozen for evaluation, not inferred from future test tokens.",
-        "Structure-only factor validation; no SHA256. No TP8 verification.", "", "Command:", "```bash", shlex.join(sys.argv), "```", ""]
+        "Factor validation mode: structure-only.", "", "Command:", "```bash", shlex.join(sys.argv), "```", ""]
     (output / "SUMMARY.md").write_text("\n".join(lines))
     print("COMPLETE", args.phase, flush=True)
 

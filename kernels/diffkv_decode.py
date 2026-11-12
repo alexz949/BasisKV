@@ -274,7 +274,7 @@ def diffkv_decode(
     num_warps = None,
     num_stages = None,
 ):
-    """Run fixed-geometry paged decode without the generic metadata branches."""
+    """Run paged decode for QK128, V64/V96, and one KV head per rank."""
 
     value_dim = int(v.shape[-1])
     num_heads = int(q.shape[1])

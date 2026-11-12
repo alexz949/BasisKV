@@ -8,7 +8,7 @@ from benchmarks.common import distribution
 
 
 def choose(logits, vocab_size):
-    # Reduce per-rank maxima instead of gathering the full vocabulary.
+    # Select the global argmax from per-rank maxima and token IDs.
     if hasattr(logits, 'to_local'):
         logits = logits.to_local()
     values, ids = logits.max(dim=-1)
