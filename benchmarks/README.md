@@ -38,7 +38,7 @@ Scope of the compact arm:
   for other ranks by tile width.
 - Tensor parallelism: layouts with one KV head and 4 or 8 query heads per rank,
   that is TP 8 for Llama-3.1-8B and Qwen3-8B. These use the DiffKV kernels in
-  `kernels/`, which read the paged cache and therefore serve the chunked
+  `basiskv_kernels/`, which read the paged cache and therefore serve the chunked
   prefill this benchmark enables. The entrypoint refuses other TP sizes for the
   compact arm: their paged backend admits only whole prompts.
 - The cache is compact layer by layer: layer `l`'s cache entry is `128 + r_l`
@@ -55,7 +55,7 @@ argument).
 ## CUDA setup
 
 Two things compile on first use on a GPU node: the CUDA extensions in
-`kernels/` (NCCL AllGather, paged attention, router), and, when vLLM starts,
+`basiskv_kernels/` (NCCL AllGather, paged attention, router), and, when vLLM starts,
 the sampling kernels of its FlashInfer dependency. Both need `nvcc` and the
 CUDA headers (including `curand.h`) of the same CUDA release as the Torch
 wheel. The CUDA runtime and NCCL (headers and `libnccl.so.2`, 2.29.7) come from
@@ -63,7 +63,7 @@ the wheels Torch already installed. Without a system CUDA 12.9 toolkit,
 install the compiler and headers into a directory of your choice:
 
 ```bash
-bash kernels/install_cuda_toolkit.sh /path/to/cuda-12.9   # nvcc 12.9.86, cudart, cccl, curand; checksums verified
+bash basiskv_kernels/install_cuda_toolkit.sh /path/to/cuda-12.9   # nvcc 12.9.86, cudart, cccl, curand; checksums verified
 export CUDA_HOME=/path/to/cuda-12.9
 ```
 
@@ -275,4 +275,4 @@ No profiler runs during its primary timing.
 
 `attention.py` is the shared HF runtime; `timing.py`, `common.py`, and
 `numa_memory.py` provide the remaining helpers. Its CUDA extensions come from
-`kernels.decode`.
+`basiskv_kernels.decode`.

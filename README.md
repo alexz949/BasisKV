@@ -226,7 +226,7 @@ guide for table-specific evaluation commands.
 core/          Joint V/O ALS, rank allocation, and Page-Fisher fitting
 calibration/   C4 and synthetic routing windows, activation statistics, and KL probes
 inference/     Hugging Face and tensor-parallel vLLM adapters
-kernels/       CUDA and Triton attention, routing, and communication
+basiskv_kernels/       CUDA and Triton attention, routing, and communication
 eval/          Quality evaluation
 appendix/      Appendix experiments
 benchmarks/    Throughput, latency, and memory measurements

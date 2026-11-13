@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# CUDA 12.9 compiler and headers for the lazily built extensions in kernels/ (AllGather, paged attention, router)
+# CUDA 12.9 compiler and headers for the lazily built extensions in basiskv_kernels/ (AllGather, paged attention, router)
 # and for the sampling kernels vLLM's FlashInfer builds at first start (these include curand.h).
-# Usage: bash kernels/install_cuda_toolkit.sh PREFIX   then   export CUDA_HOME=PREFIX
+# Usage: bash basiskv_kernels/install_cuda_toolkit.sh PREFIX   then   export CUDA_HOME=PREFIX
 # Torch's own wheels supply the CUDA runtime and NCCL (headers and library); nvcc and the CUDA headers are added here.
 set -euo pipefail
 toolkit=$(realpath -m "$1")

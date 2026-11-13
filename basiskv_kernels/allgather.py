@@ -10,7 +10,7 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
-from kernels.build import CSRC, load_cuda_extension
+from basiskv_kernels.build import CSRC, load_cuda_extension
 
 
 @lru_cache(maxsize=1)

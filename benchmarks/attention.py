@@ -17,9 +17,9 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from inference.model import router_factors
 from core.router import align_value_basis
 from inference.tp import ChunkedTokenwise, fold_value_weight, head_slices, load_layer, load_manifest
-from kernels.allgather import AllGather
-from kernels.decode import load_paged_attention, load_router
-from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
+from basiskv_kernels.allgather import AllGather
+from basiskv_kernels.decode import load_paged_attention, load_router
+from basiskv_kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 SPLITS = 16
 
@@ -137,7 +137,7 @@ class Attention(nn.Module):
             return self.paged.attention(self.key_cache, query, self.value_cache,
                 self.page_ids[:, :, :math.ceil(end / self.page_size)], self.dense_workspace, self.output,
                 end, self.scaling, SPLITS)
-        from kernels.sparse_attention import sparse_attention
+        from basiskv_kernels.sparse_attention import sparse_attention
 
         historical = end - RECENT_TOKENS
         scores = self.scores[..., :math.ceil(historical / self.page_size)]

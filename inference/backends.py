@@ -1,7 +1,7 @@
 """Paged DiffKV kernels and the single-KV-head prepared-output specialization."""
 
 import torch
-from kernels.compressed_v_prefill import compressed_v_prefill_attention
+from basiskv_kernels.compressed_v_prefill import compressed_v_prefill_attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend, FlashAttentionDiffKVImpl
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
@@ -11,8 +11,8 @@ from functools import lru_cache
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.backends.triton_attn_diffkv import TritonAttentionDiffKVBackend, TritonAttentionDiffKVImpl
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder
-from kernels.diffkv_decode import diffkv_decode
-from kernels.diffkv_prefill import diffkv_prefill
+from basiskv_kernels.diffkv_decode import diffkv_decode
+from basiskv_kernels.diffkv_prefill import diffkv_prefill
 
 NUM_KV_SPLITS = 8
 

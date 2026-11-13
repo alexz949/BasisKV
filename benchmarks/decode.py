@@ -4,7 +4,7 @@ import argparse
 import statistics
 
 from benchmarks.common import add_model_arguments, arguments, load_model, metadata, prompts, save
-from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
+from basiskv_kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def main():

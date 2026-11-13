@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from kernels.routing_config import PAGE_SIZES, RECENT_TOKENS, ROUTED_TOKENS, SUPPORT
+from basiskv_kernels.routing_config import PAGE_SIZES, RECENT_TOKENS, ROUTED_TOKENS, SUPPORT
 
 
 class GroupSelectionTest(unittest.TestCase):
@@ -40,7 +40,7 @@ class CudaRouterChecks:
         import torch
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
             self.skipTest('requires an sm_80+ CUDA GPU')
-        from kernels.decode import load_router
+        from basiskv_kernels.decode import load_router
         self.torch = torch
         self.router = load_router(self.value_dim, page_size=self.page_size)
         self.routed_pages = ROUTED_TOKENS // self.page_size
@@ -63,7 +63,7 @@ class CudaRouterChecks:
                 scores = scores[..., :pages]  # exercise the benchmark's strided output view
                 scores[..., 0] = -10000  # page zero must not be pinned
                 mass = scores.softmax(-1).amax(2)
-                expected_pages = mass.argsort(-1, descending=True, stable=True)[..., :self.routed_pages].sort(-1).values
+                expected_pages = mass.argsort(dim=-1, descending=True, stable=True)[..., :self.routed_pages].sort(-1).values
                 self.router.select_pages(scores, selected, support, scratch, historical, historical + RECENT_TOKENS)
                 t.testing.assert_close(selected, expected_pages, rtol=0, atol=0)
                 expected = (expected_pages[..., None] * self.page_size + t.arange(self.page_size, device='cuda')).flatten(-2)
@@ -95,7 +95,7 @@ class CudaRouterChecks:
 
     def test_host_slots_and_2112_token_attention(self):
         t = self.torch
-        from kernels.sparse_attention import sparse_attention
+        from basiskv_kernels.sparse_attention import sparse_attention
         capacity = 131200
         host = self.router.host_key_buffer(1, 1, capacity)
         host.copy_(t.randn(1, 1, capacity, 128, dtype=t.bfloat16))
@@ -127,7 +127,7 @@ class CudaRouterChecks:
 
     def test_dense_paged_attention(self):
         t = self.torch
-        from kernels.decode import load_paged_attention
+        from basiskv_kernels.decode import load_paged_attention
         attention = load_paged_attention(self.value_dim, 4, page_size=self.page_size)
         length = 1003
         query = t.randn(1, 4, 1, 128, device='cuda', dtype=t.bfloat16)
@@ -241,12 +241,12 @@ class BuildConfigurationTest(unittest.TestCase):
                 self.assertEqual(dense.page_ids.shape, (1, 1, math.ceil(2201 / page_size)))
 
     def test_page_and_value_width_builds_are_independent(self):
-        from kernels.decode import load_router, load_paged_attention
+        from basiskv_kernels.decode import load_router, load_paged_attention
         load_router.cache_clear()
         load_paged_attention.cache_clear()
         self.addCleanup(load_router.cache_clear)
         self.addCleanup(load_paged_attention.cache_clear)
-        with patch('kernels.decode.load_cuda_extension', side_effect=lambda *a, **k: object()) as build:
+        with patch('basiskv_kernels.decode.load_cuda_extension', side_effect=lambda *a, **k: object()) as build:
             routers, attentions = [], []
             for page_size in PAGE_SIZES:
                 for width in (64, 96, 128):

@@ -8,8 +8,8 @@ documented in the CUDA sources, which check them with asserts.
 
 from functools import lru_cache
 
-from kernels.build import CSRC, load_cuda_extension
-from kernels.routing_config import PAGE_SIZES, RECENT_TOKENS, ROUTED_TOKENS
+from basiskv_kernels.build import CSRC, load_cuda_extension
+from basiskv_kernels.routing_config import PAGE_SIZES, RECENT_TOKENS, ROUTED_TOKENS
 
 QUERIES_PER_KV = 4
 RANK = 16

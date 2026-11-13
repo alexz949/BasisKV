@@ -16,7 +16,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from inference.backends import joint_value_diffkv_backend, paged_backend
 from core.model_layout import ValueGeometry
 from inference.tp import fold_value_weight, head_slices, layer_ranks, load_layer, load_manifest, single_kv_head_layout
-from kernels.allgather import AllGather
+from basiskv_kernels.allgather import AllGather
 
 def check_supported(vllm_config):
     """One envelope check for every adapter: BF16 text decoding, no quantization, LoRA, speculation, or PP/DCP/DP."""

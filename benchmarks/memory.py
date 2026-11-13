@@ -5,7 +5,7 @@ import os
 from datetime import timedelta
 
 from benchmarks.common import add_model_arguments, arguments, distribution, load_model, metadata, prompts, save
-from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
+from basiskv_kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def summarize(ranks, batch, steps):

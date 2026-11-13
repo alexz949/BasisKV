@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timezone
 import torch
 
-from kernels.routing_config import DEFAULT_PAGE_SIZE, PAGE_SIZES
+from basiskv_kernels.routing_config import DEFAULT_PAGE_SIZE, PAGE_SIZES
 
 
 def command(args):
@@ -23,7 +23,7 @@ def metadata():
     hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in sorted(root.rglob('*')) if p.is_file() and p.suffix in suffixes
               and p.relative_to(root).parts[0] in
-              {'core', 'calibration', 'inference', 'kernels', 'benchmarks', 'eval', 'appendix',
+              {'core', 'calibration', 'inference', 'basiskv_kernels', 'benchmarks', 'eval', 'appendix',
                'pyproject.toml', 'requirements.txt', 'requirements-tp.txt', 'requirements-qwen35.txt'}}
     snapshot=command(['nvidia-smi','--query-compute-apps=gpu_uuid,pid,used_gpu_memory','--format=csv,noheader,nounits'])
     tree=command(['ps','-eo','pid=,ppid='])['stdout'].splitlines()
