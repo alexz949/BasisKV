@@ -228,10 +228,6 @@ compact attention did not execute during that batch size. AllGather plans
 are prepared once per width and token count before CUDA Graph capture and
 reused afterwards.
 
-A run with a per-layer bank measures that bank only. Throughput measured
-with a uniform bank does not carry over to a different schedule; pair any
-quality number with a throughput number taken from the same factor directory.
-
 HF runners reset cache lengths and persistent-Key mappings for each request.
 Prefill and conditioning are excluded from steady timing. `decode.py` performs
 one same-shape warmup request, then reports the median of three trial medians.
