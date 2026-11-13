@@ -1,6 +1,6 @@
 """CPU numerics of the compact-Value vLLM adapters against the Hugging Face reference with the same factors.
 
-Every tensor-parallel rank is a real adapter instance (BasisKVLlamaForCausalLM or
+Uniform banks and a per-layer (`core.allocate`-style) bank are served. Every tensor-parallel rank is a real adapter instance (BasisKVLlamaForCausalLM or
 BasisKVQwen3ForCausalLM), built and weight-loaded by vLLM's own code. The ranks run as threads of one
 process and exchange tensors through an in-process stand-in for the TP group, so the sharded
 embeddings, MLPs, LM head, Q/K/V projections, norms, RoPE, Value folding, and decoders are the
@@ -22,14 +22,16 @@ from torch import nn
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
-from core.factor_io import merge, write_layer
+from core.factor_io import assemble, merge, write_layer
 from core.model_layout import ValueGeometry
 from inference import COMPACT_ARCHITECTURES, register
 from inference.model import install_factors
-from inference.tp import single_kv_head_layout
+from inference.tp import load_manifest, single_kv_head_layout
 
-LAYERS, HEADS, KV_HEADS, HEAD_DIM, HIDDEN, VOCAB = 2, 32, 8, 128, 512, 128
+LAYERS, HEADS, KV_HEADS, HEAD_DIM, HIDDEN, VOCAB = 4, 32, 8, 128, 512, 128
 PREFILL, DECODE = 32, 4
+UNIFORM_RANKS = (32, 64, 96, 128)
+ADAPTIVE_RANKS = (32, 96, 128, 64)  # one rank per layer: a small one, 96, the dense endpoint, 64
 
 
 class EmulatedGroup:
@@ -93,14 +95,17 @@ class ReferenceAttention(nn.Module):
 class ConcatenatingBoundary:
     """Emulate PreparedC1Output with in-process concatenation and the same call contract."""
 
-    def __init__(self, group, device, local_width, max_tokens):
-        self.local_width = local_width
+    def __init__(self, group, device, max_local_width, max_tokens):
+        self.max_local_width = max_local_width
+        self.gathered_widths = []
 
     def attention(self, attn_layer, query, key, value, kv_cache, attn_metadata, decoder):
         from vllm.distributed import get_tp_group
         local = attn_layer.attend(query, key, value).flatten(1)
-        assert local.shape[1] == self.local_width
-        return get_tp_group().all_gather(local, -1) @ decoder
+        assert local.shape[1] <= self.max_local_width
+        gathered = get_tp_group().all_gather(local, -1)
+        self.gathered_widths.append(gathered.shape[1])
+        return gathered @ decoder
 
 
 def write_model(directory, kind):
@@ -114,7 +119,7 @@ def write_model(directory, kind):
     return model.config
 
 
-def write_factors(directory, config, rank):
+def write_uniform(directory, config, rank):
     geometry = ValueGeometry.from_config(config, range(LAYERS))
     fit = dict(cache_rank_per_head=rank, geometry=geometry.to_dict(), fit_windows=0, heldout_windows=0, encoder_sweeps=0)
     directory.mkdir()
@@ -124,6 +129,25 @@ def write_factors(directory, config, rank):
         write_layer(directory, layer, encoder, decoder, dict(fit_config=fit, solver=dict(method='random'),
             fit=dict(factor_dtype_relative_mse=0.0), heldout=dict(factor_dtype_relative_mse=0.0)))
     merge(directory, range(LAYERS), geometry)
+
+
+def write_adaptive(directory, root, kind, ranks):
+    """The bank `core.allocate` writes: layer l copied from the uniform bank of rank ranks[l]."""
+    assemble(directory, {rank: root / f'{kind}_v{rank}' for rank in set(ranks)}, list(ranks), dict(method='test'))
+
+
+def planned_cache_bytes(vllm_config, model):
+    """Per-layer page bytes and pool bytes per block from vLLM's own cache planner, for the specs the adapter's layers report."""
+    from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts, resolve_kv_cache_layout
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups, get_kv_cache_groups
+    attentions = [layer.self_attn.attn for layer in model.model.layers]
+    specs = {attention.layer_name: attention.get_kv_cache_spec(vllm_config) for attention in attentions}
+    layouts = get_supported_kv_cache_layouts([attention.attn_backend for attention in attentions])
+    resolve_kv_cache_layout(vllm_config, [[layout.name for layout in layouts]], specs.values())  # as the engine core does
+    groups = get_kv_cache_groups(vllm_config, specs)
+    config = get_kv_cache_config_from_groups(vllm_config, groups, available_memory=1 << 30)
+    pool = {tensor.size // config.num_blocks for tensor in config.kv_cache_tensors}
+    return [spec.page_size_bytes for spec in specs.values()], pool, next(iter(specs.values())).block_size, len(groups)
 
 
 def build_rank(model_dir, factors, architecture, group, references, chunked_prefill):
@@ -143,12 +167,16 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
     model.logits_processor.head_dtype = torch.float32  # vLLM's LM head otherwise casts to the configured BF16
     loaded = model.load_weights(load_file(str(model_dir / 'model.safetensors')).items())
     assert {name for name, _ in model.named_parameters()} <= loaded, 'a parameter was left uninitialized'
-    rank = model.model.layers[0].self_attn.value_rank
-    for layer in model.model.layers:
+    ranks = load_manifest(factors)['layer_ranks']
+    local_kv = model.model.layers[0].self_attn.num_kv_heads
+    # vLLM's cache planner keeps the layers in one group and sizes each layer's tensor by its own rank: no padding to the widest.
+    pages, pool, block_size, groups = planned_cache_bytes(vllm_config, model)
+    assert pages == [2 * block_size * local_kv * (HEAD_DIM + rank) for rank in ranks], 'a layer cache page is not sized by its own rank'
+    assert groups == 1 and pool == {sum(pages)}, 'the cache pool does not hold exactly the sum of the layer pages'
+    for layer, rank in zip(model.model.layers, ranks, strict=True):
         attention = layer.self_attn
         real = attention.attn
-        local_kv = attention.num_kv_heads
-        assert attention.qkv_proj.value_loaded and real.head_size_v == rank
+        assert attention.qkv_proj.value_loaded and attention.value_rank == real.head_size_v == rank
         # Check the compact Value width in the backend cache layout.
         assert real.attn_backend.get_kv_cache_shape(4, 16, local_kv, HEAD_DIM) == (4, 16, local_kv, HEAD_DIM + rank)
         assert attention.qkv_proj.weight.shape[0] == (attention.num_heads + local_kv) * HEAD_DIM + local_kv * rank
@@ -161,14 +189,15 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
     return model
 
 
-def serve(kind, rank, world_size, root):
-    """Logits of the emulated TP deployment and of the HF reference, for one prompt and a few decode steps."""
+def serve(kind, bank, world_size, root):
+    """Teacher-forced logits of the emulated TP deployment and of the HF reference with the same factors."""
     from vllm.distributed import parallel_state
     import vllm.model_executor.layers.attention.attention as attention_layer
     import inference.vllm as adapter
     from inference.backends import paged_backend
 
-    model_dir, factors = root / kind, root / f'{kind}_v{rank}'
+    model_dir, factors = root / kind, root / f'{kind}_{bank}'
+    ranks = load_manifest(factors)['layer_ranks']
     group = EmulatedGroup(world_size)
     parallel_state._TP = group
     parallel_state._PP = types.SimpleNamespace(world_size=1, rank_in_group=0, is_first_rank=True, is_last_rank=True)
@@ -184,7 +213,7 @@ def serve(kind, rank, world_size, root):
         models.append(build_rank(model_dir, factors, COMPACT_ARCHITECTURES[kind], group, references, chunked_prefill=prepared))
     assert all((model.c1_boundary is not None) == prepared for model in models)
 
-    tokens = torch.randint(0, VOCAB, (PREFILL + DECODE,), generator=torch.Generator().manual_seed(rank + world_size))
+    tokens = torch.randint(0, VOCAB, (PREFILL + DECODE,), generator=torch.Generator().manual_seed(sum(ranks) + world_size))
     # The DiffKV layout takes the prompt in two chunks, the second attending to the cached first; the paged
     # layout admits it whole. Decode then feeds one token per step.
     half = PREFILL // 2
@@ -212,8 +241,15 @@ def serve(kind, rank, world_size, root):
     for model in models:
         attentions = [layer.self_attn for layer in model.model.layers]
         assert all(attention.calls == len(steps) for attention in attentions)
-    caches = list(references.values()) if prepared else [layer.self_attn.attn for model in models for layer in model.model.layers]
-    assert all(cache.values.shape == (PREFILL + DECODE, KV_HEADS // world_size, rank) for cache in caches), 'the cached Value is not compact'
+    local_heads = HEADS // world_size
+    for index, model in enumerate(models):
+        for layer, rank in zip(model.model.layers, ranks, strict=True):
+            cache = references[index, layer.self_attn.attn.layer_name] if prepared else layer.self_attn.attn
+            assert cache.values.shape == (PREFILL + DECODE, KV_HEADS // world_size, rank), 'a cached Value does not have its layer rank'
+            assert layer.self_attn.decoder.shape == (HEADS * rank, HIDDEN)
+        if prepared:  # each layer gathered its own width, in layer order, on every step
+            assert model.c1_boundary.gathered_widths == [HEADS * rank for rank in ranks] * len(steps), 'a collective did not carry its layer width'
+            assert model.c1_boundary.max_local_width == local_heads * max(ranks)
 
     reference = install_factors(AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, local_files_only=True).eval(),
                                 value_factors=factors)
@@ -239,15 +275,16 @@ def main():
         root = Path(temporary)
         for kind in COMPACT_ARCHITECTURES:
             config = write_model(root / kind, kind)
-            for rank in (64, 96):
-                write_factors(root / f'{kind}_v{rank}', config, rank)
+            for rank in UNIFORM_RANKS:
+                write_uniform(root / f'{kind}_v{rank}', config, rank)
+            write_adaptive(root / f'{kind}_adaptive', root, kind, ADAPTIVE_RANKS)
         worst = 0.0
         for kind in COMPACT_ARCHITECTURES:
-            for rank, world_size in ((64, 8), (96, 8), (96, 4), (96, 2), (96, 1)):
-                logits, expected = serve(kind, rank, world_size, root)
+            for bank, world_size in (('v64', 8), ('v96', 8), ('adaptive', 8), ('adaptive', 4), ('adaptive', 2), ('v96', 1), ('adaptive', 1)):
+                logits, expected = serve(kind, bank, world_size, root)
                 error = float((logits - expected).abs().max() / expected.abs().max())
                 worst = max(worst, error)
-                print(f'{kind:5s} V{rank} TP{world_size}: relative max logit error {error:.2e}, argmax agreement '
+                print(f'{kind:5s} {bank:8s} TP{world_size}: relative max logit error {error:.2e}, top-1 agreement '
                       f'{int((logits.argmax(-1) == expected.argmax(-1)).sum())}/{len(expected)}', flush=True)
                 assert torch.isfinite(logits).all() and error < 1e-4, 'the compact path differs from the reference with the same factors'
 
@@ -260,7 +297,7 @@ def main():
         assert refused(lambda: build('qwen3', 'llama_v96', COMPACT_ARCHITECTURES['qwen3'])), 'factors of another model were accepted'
         parallel_state._TP = group = EmulatedGroup(4)
         group.local.rank = 0
-        assert refused(lambda: build('llama', 'llama_v96', COMPACT_ARCHITECTURES['llama'])), 'chunked prefill was accepted on the paged layout'
+        assert refused(lambda: build('llama', 'llama_adaptive', COMPACT_ARCHITECTURES['llama'])), 'chunked prefill was accepted on the paged layout'
     print(f'PASS: worst relative max logit error {worst:.2e}')
 
 

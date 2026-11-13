@@ -109,10 +109,10 @@ class C1DiffKVImpl(TritonAttentionDiffKVImpl):
     def __init__(self, *args, **kwargs):
         self.value_rank = int(kwargs.pop('value_rank', 64))
         super().__init__(*args, **kwargs)
-        assert (self.head_size == 128 and self.num_heads in (4, 8) and self.num_kv_heads == 1 and self.value_rank in (64, 96)
+        assert (self.head_size == 128 and self.num_heads in (4, 8) and self.num_kv_heads == 1 and 0 < self.value_rank <= 128
                 and self.alibi_slopes is None and self.sinks is None and self.sliding_window == (-1, -1)
                 and self.logits_soft_cap == 0 and not self.use_alibi_sqrt), (
-            'the DiffKV kernels are compiled for one local KV head with 4 or 8 query heads, head_dim 128, Value rank 64 or 96, '
+            'the DiffKV kernels are compiled for one local KV head with 4 or 8 query heads, head_dim 128, a Value rank up to 128, '
             'and plain softmax attention')
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None):

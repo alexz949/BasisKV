@@ -230,26 +230,27 @@ def _launch_config(
     num_heads,
     value_dim,
 ):
-    assert num_heads in (4, 8) and value_dim in (64, 96)
+    # Tile shapes follow the padded Value block (64 or 128 wide); they were tuned at V64 and V96.
+    wide = value_dim > 64
     if num_sequences > split_threshold:
-        if num_heads == 8 and value_dim == 64:
+        if num_heads == 8 and not wide:
             return 1, 64, 4, 3
         return 1, 32, 4, 3
     if num_sequences == split_threshold:
         return 1, 64, 4, 3
     if num_sequences == 1 and max_sequence_length <= 1024:
-        if num_heads == 8 and value_dim == 64:
+        if num_heads == 8 and not wide:
             return 16, 64, 4, 2
         return 16, 64, 8, 2
     if num_sequences <= 8:
         return 16, 128, 4, 2
     if num_sequences <= 32:
-        if value_dim == 96 and num_heads == 4:
+        if wide and num_heads == 4:
             return 8, 64, 4, 3
-        if value_dim == 96:
+        if wide:
             return 16, 32, 4, 2
         return 16, 64, 4, 3
-    if num_sequences <= 64 and num_heads == 8 and value_dim == 64:
+    if num_sequences <= 64 and num_heads == 8 and not wide:
         return 8, 32, 4, 2
     return 1, 64, 4, 3
 
@@ -274,7 +275,7 @@ def diffkv_decode(
     num_warps = None,
     num_stages = None,
 ):
-    """Run paged decode for QK128, V64/V96, and one KV head per rank."""
+    """Run paged decode for QK128, a compact Value up to 128 wide, and one KV head per rank."""
 
     value_dim = int(v.shape[-1])
     num_heads = int(q.shape[1])
@@ -282,7 +283,7 @@ def diffkv_decode(
     assert q.shape[1:] == (num_heads, 128) and num_heads in (4, 8)
     assert k.shape[2:] == (1, 128) and v.shape[2:] == (1, value_dim)
     assert out.shape[1:] == (num_heads, value_dim)
-    assert value_dim in (64, 96)
+    assert 0 < value_dim <= 128
     assert k.shape[1] == v.shape[1]
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
     assert softmax_segm_output.is_contiguous()
