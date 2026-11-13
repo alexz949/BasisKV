@@ -9,6 +9,8 @@ import sys
 from datetime import datetime, timezone
 import torch
 
+from kernels.routing_config import DEFAULT_PAGE_SIZE, PAGE_SIZES
+
 
 def command(args):
     p = subprocess.run(args, text=True, capture_output=True)
@@ -66,6 +68,8 @@ def add_model_arguments(parser):
     parser.add_argument('--arm', choices=('dense', 'basis'), required=True)
     parser.add_argument('--value-factors', type=Path)
     parser.add_argument('--router-dir', type=Path)
+    parser.add_argument('--page-size', type=int, choices=PAGE_SIZES, default=DEFAULT_PAGE_SIZE,
+                        help='routing/attention page size, independent of Value rank; must match router calibration')
     parser.add_argument('--tokens', type=Path, required=True, help='Safetensors with a [samples, tokens] input_ids tensor')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=3)

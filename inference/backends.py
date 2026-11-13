@@ -98,13 +98,13 @@ class PagedImpl(FlashAttentionDiffKVImpl):
             output_slice.copy_(compact_output.squeeze(0).transpose(0, 1))
         return output
 
-class C1DiffKVBackend(TritonAttentionDiffKVBackend):
+class JointValueDiffKVBackend(TritonAttentionDiffKVBackend):
 
     @staticmethod
     def get_impl_cls():
-        return C1DiffKVImpl
+        return JointValueDiffKVImpl
 
-class C1DiffKVImpl(TritonAttentionDiffKVImpl):
+class JointValueDiffKVImpl(TritonAttentionDiffKVImpl):
 
     def __init__(self, *args, **kwargs):
         self.value_rank = int(kwargs.pop('value_rank', 64))
@@ -131,7 +131,7 @@ class C1DiffKVImpl(TritonAttentionDiffKVImpl):
         return output
 
 @lru_cache(maxsize=None)
-def c1_diffkv_backend(value_rank):
+def joint_value_diffkv_backend(value_rank):
     """Return a cached DiffKV backend with V-sized split-KV scratch."""
     selected_rank = int(value_rank)
 
@@ -141,11 +141,11 @@ def c1_diffkv_backend(value_rank):
             super().__init__(kv_cache_spec, layer_names, vllm_config, device)
             self.softmax_segm_output = torch.empty((self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments, next_power_of_2(selected_rank)), dtype=torch.float32, device=device)
 
-    class RankedImpl(C1DiffKVImpl):
+    class RankedImpl(JointValueDiffKVImpl):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, value_rank=selected_rank, **kwargs)
 
-    class RankedBackend(C1DiffKVBackend):
+    class RankedBackend(JointValueDiffKVBackend):
         head_size_v = selected_rank
 
         @staticmethod
@@ -159,9 +159,9 @@ def c1_diffkv_backend(value_rank):
         @staticmethod
         def get_builder_cls():
             return RankedMetadataBuilder
-    RankedMetadataBuilder.__name__ = f'C1DiffKVMetadataBuilderV{selected_rank}'
+    RankedMetadataBuilder.__name__ = f'JointValueDiffKVMetadataBuilderV{selected_rank}'
     RankedMetadataBuilder.__qualname__ = RankedMetadataBuilder.__name__
-    RankedBackend.__name__ = f'C1DiffKVBackendV{selected_rank}'
+    RankedBackend.__name__ = f'JointValueDiffKVBackendV{selected_rank}'
     RankedBackend.__qualname__ = RankedBackend.__name__
     return RankedBackend
 

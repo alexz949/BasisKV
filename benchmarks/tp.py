@@ -108,8 +108,8 @@ def main():
         assert single_kv_head_layout(fit["geometry"], args.tp_size), (
             "this benchmark admits prompts in chunks, which the compact path serves with one KV head and 4 or 8 query heads "
             "per rank (TP 8 for Llama-3.1-8B and Qwen3-8B)")
-        overrides = {"architectures": [COMPACT_ARCHITECTURES[model_type]], "basiskv_c1_factor_dir": str(root),
-                     "basiskv_c1_validation": args.factor_validation}
+        overrides = {"architectures": [COMPACT_ARCHITECTURES[model_type]], "basiskv_joint_value_factor_dir": str(root),
+                     "basiskv_joint_value_validation": args.factor_validation}
     import torch
     import transformers
     import triton
@@ -173,7 +173,7 @@ def main():
                                   preemptions=measured["preemptions"],
                                   output_tokens_per_second=measured["output_tokens_per_second"],
                                   ttft_ms=measured["ttft_ms"], tpot_ms=measured["tpot_ms"])), flush=True)
-        row["workers"] = llm.collective_rpc("basiskv_c1_statistics" if args.arm == "basis" else "basiskv_cuda_statistics")
+        row["workers"] = llm.collective_rpc("basiskv_joint_value_statistics" if args.arm == "basis" else "basiskv_cuda_statistics")
         if args.arm == "basis":
             # Layer by layer, every rank loaded the scheduled factors, holds a cache tensor whose Value width is that
             # layer's rank, and gathered exactly that layer's width; it also executed the compact attention during

@@ -129,10 +129,8 @@ only when their protocol fingerprint matches. Missing examples prevent a
 complete summary. Both task scores and the unweighted task mean are saved in
 `result.json`.
 
-## Appendix and verification
+## Appendix
 
 Appendix-specific drivers and task definitions live in
 [`../appendix/`](../appendix/README.md).
 
-The release smoke checks use small CPU models and simulated input data.
-Run substantial evaluations through the scheduler.

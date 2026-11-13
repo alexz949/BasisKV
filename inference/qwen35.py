@@ -173,10 +173,10 @@ def qwen35_decoder_layers(model):
     return getattr(body, 'language_model', body).layers
 
 
-FACTOR_FORMAT = 'basiskv.qwen35.gdn_private_ag_joint_factors.v2'
+FACTOR_FORMAT = 'basiskv.qwen35.gdn_factors.v1'
 
 
-def load_qwen35_gdn_private_ag_factors(path):
+def load_gdn_factors(path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
     assert payload['format'] == FACTOR_FORMAT and payload['schema_version'] == 1, f'{path} is not a GDN private-AG bank'
     return payload
@@ -218,10 +218,10 @@ class Qwen35PrivateAGRecord(NamedTuple):
     total_private_rank: int
 
 
-class Qwen35PrivateAGRuntime:
+class GDNRuntime:
     def __init__(self, model, factors, *, factor_dtype=None):
         self.model = model
-        self.factors = load_qwen35_gdn_private_ag_factors(factors) if isinstance(factors, (str, Path)) else factors
+        self.factors = load_gdn_factors(factors) if isinstance(factors, (str, Path)) else factors
         self.factor_dtype, self.originals, self.records = factor_dtype, {}, ()
 
     def install(self):

@@ -110,6 +110,17 @@ def apply_base(codes, factors):
     return torch.einsum("tgi,gir,grd->tgd", codes, left, right) + bias
 
 
+def align_value_basis(base_left, base_right):
+    """Orthogonal Q and the predictor in its first base-rank coordinates (Section 4.1).
+
+    If L = Q_b R, then c L B = (c Q)[:, :base_rank] (R B).
+    Fold Q into the Value encoder and Q^T into every head's output decoder.
+    """
+    rank = base_left.shape[-1]
+    rotation, triangular = torch.linalg.qr(base_left, mode="complete")
+    return rotation, triangular[..., :rank, :] @ base_right
+
+
 def value_codes(dense_value, encoder):
     return torch.einsum("tgd,gdr->tgr", dense_value, encoder)
 
@@ -130,7 +141,7 @@ def rotate_half(values):
 def apply_rotary(value, cos, sin):
     """RoPE in the dtype of `value` on the configured prefix; Qwen3.5 leaves the suffix unchanged.
 
-    Calibration passes FP32 rows; inference passes the BF16 cache rows, as the paper's router did.
+    Calibration passes FP32 rows; inference uses the cache dtype.
     """
     width = cos.shape[-1]
     cosine, sine = cos.to(device=value.device, dtype=value.dtype).unsqueeze(1), sin.to(device=value.device, dtype=value.dtype).unsqueeze(1)

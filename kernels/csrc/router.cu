@@ -1,4 +1,4 @@
-// Page4 B16R16 GQA4 conditional router for the system benchmarks.
+// Page1–Page32 B16R16 GQA4 conditional router for the system benchmarks.
 //
 // Four entry points cover one decode step: append_decode writes a token's Value latent,
 // Base coordinates, and residual code (and the exact Key into mapped host memory when the
@@ -43,12 +43,13 @@ constexpr int kValueRank = BASIS_VALUE_DIM;
 constexpr int kBaseRank = BASIS_BASE_RANK;
 constexpr int kResidualRank = BASIS_RESIDUAL_RANK;
 constexpr int kPageSize = BASIS_PAGE_SIZE;
-constexpr int kScanWarps = 8;  // 16 scored tokens per warp, 32 Page4 pages per block
+constexpr int kScanWarps = 8;  // 16 scored tokens per warp, 128 tokens per block
 constexpr int kTokensPerBlock = kScanWarps * 16;
 constexpr int kPagesPerBlock = kTokensPerBlock / kPageSize;
 constexpr int kMaxSupport = BASIS_ROUTED_TOKENS + BASIS_RECENT_TOKENS;
-static_assert(kPageSize == 4 && kQueriesPerKv == 4,
-              "the page scan is written for Page4 with four query heads per KV head");
+static_assert(kPageSize >= 1 && kPageSize <= 32 && (kPageSize & (kPageSize - 1)) == 0 &&
+                  kQueriesPerKv == 4,
+              "the page scan supports power-of-two pages up to 32 with four query heads per KV head");
 static_assert(kBaseRank == 8 || kBaseRank == 16, "the Base reconstruction MMA covers ranks 8 and 16");
 static_assert(kResidualRank > 0 && kResidualRank <= kQueryKeyDim, "residual rank");
 
@@ -403,7 +404,7 @@ __global__ void append_decode_kernel(
   }
 }
 
-// Map selected tokens to persistent Key slots after Page4 selection.
+// Map selected tokens to persistent Key slots after page selection.
 __global__ void plan_slots_kernel(
     const int64_t* __restrict__ support_ids, int64_t* __restrict__ resident,
     int* __restrict__ lookup, int64_t* __restrict__ slots,
@@ -552,7 +553,7 @@ at::Tensor append_host_key(const at::Tensor& host_key, const at::Tensor& key, in
 // query [B, H, 1, 128]; base_code [B, G, T, BASE_RANK]; residual_code [B, G, T, RESIDUAL_RANK];
 // base_right [G, BASE_RANK, 128]; base_bias [G, 128]; residual_query [H, 128, RESIDUAL_RANK];
 // rope_cos / rope_sin [T, 64]; query_code [B, G, 4, RESIDUAL_RANK] scratch;
-// output [B, G, 4, ceil(T / 4)] FP32 page log-sum-exp.
+// output [B, G, 4, ceil(T / PAGE_SIZE)] FP32 page log-sum-exp.
 at::Tensor page_lse(const at::Tensor& query, const at::Tensor& base_code,
                     const at::Tensor& residual_code, const at::Tensor& base_right,
                     const at::Tensor& base_bias, const at::Tensor& residual_query,
@@ -728,7 +729,7 @@ void select_pack_refresh(const at::Tensor& page_log_mass, const at::Tensor& page
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   namespace py = pybind11;
-  module.doc() = "Page4 B16R16 GQA4 conditional router: append, page scan, selection, slot refresh";
+  module.doc() = "Page1–Page32 B16R16 GQA4 conditional router: append, page scan, selection, slot refresh";
   module.def("selection_workspace_size", []() { return kScratchWords; });
   module.def("host_key_buffer", &host_key_buffer, py::arg("batch"), py::arg("kv_heads"),
              py::arg("capacity"));

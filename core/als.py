@@ -9,7 +9,7 @@ is the quadratic
 
 where normal[h, k] = A[g(h)]^T C[h, k] A[g(k)] and rhs[h] = A[g(h)]^T B[h] with
 B[h] = sum_k C[h, k] W[k]. ALS alternates a closed-form decoder solve with one
-CG step per group on the shared encoder, then re-orthonormalizes A by QR.
+CG solve per group on the shared encoder, then re-orthonormalizes A by QR.
 """
 
 import math

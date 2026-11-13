@@ -1,6 +1,6 @@
 # Performance benchmarks
 
-Three public entrypoints share the current Value/router loaders and timing helpers.
+Three entrypoints share the Value/router loaders and timing helpers.
 Run from the `BasisKV/` root. Model weights, factors, token inputs, and results are
 external inputs/outputs.
 
@@ -84,11 +84,11 @@ Set `BASISKV_EXT_BUILD_DIR` to keep the built extensions between runs.
 Run the offline calibration-to-inference CPU smoke with the base environment:
 
 ```bash
-python -m unittest tests.test_standalone tests.test_routing_windows -v
+python -m unittest tests.test_algorithms tests.test_standalone tests.test_routing_windows -v
 ```
 
 
-Check Page4 routing, resident/host-Key selection, and attention on an sm_80+
+Check routing at each supported page size, resident/host-Key selection, and attention on an sm_80+
 CUDA GPU with the base environment:
 
 ```bash
@@ -120,21 +120,26 @@ python -m tests.test_compact_tp
   benchmark. The HF runners (`decode.py`, `memory.py`) take uniform banks;
   HF BasisKV can omit the factors for the dense-V routing control used in
   Table 3.
-- `--router-dir`: required for HF BasisKV. Current layer safetensors and JSON
-  records must follow **Page4/B16R16**, with `--pinned-pages 0` and an exact
+- `--router-dir`: required for HF BasisKV. Layer safetensors and JSON
+  records must follow **B16R16** at the selected `--page-size`, with
+  `--pinned-pages 0` and an exact
   recent-64 tail. The loader checks the ranks, page size, prefix, and recent
   setting against the router's calibration record.
 
-The system kernel selects **512 × 4 = 2,048 historical tokens + 64 recent
-= 2,112 total support**, with no pinned prefix. Output records include the
+`benchmarks.decode` and `benchmarks.memory` accept `--page-size {1,2,4,8,16,32}`
+(default: 4), independently of V64/V96/V128. Every page size selects **2,048
+historical tokens + 64 recent = 2,112 total support**, with no pinned prefix.
+The historical page count is `2048 / page_size`: 2,048 pages at Page1,
+512 at Page4, or 64 at Page32. Output records include the
 page size, pinned-page count, routed and recent budgets, and total support.
 
 HF attention derives layer/head counts from the model configuration and supports
 QK128 and V64/V96/V128. Routed execution requires four query heads per KV head;
 TP evenly partitions KV groups. Qwen3 Q/K normalization is retained. Compact
 routed V is changed into Base-aligned coordinates during loading, so the first
-16 Value coordinates also hold Base. The decoder absorbs the inverse change.
-The loader applies this coordinate change to the fitted Value factors.
+16 Value coordinates also hold Base. The loader folds the orthogonal rotation
+`Q` into the Value encoder, `Q^T` into the decoder, and the QR triangular factor
+into the Key predictor.
 
 ## Commands
 
@@ -155,11 +160,14 @@ python -m calibration.windows --model MODEL --split validation \
 Set `--tokens` to the corresponding `windows.safetensors`; increase
 `--fit-windows` when measuring batches larger than eight at long context.
 
-Prepare a B16R16 Page4 router for the Value factors used by the HF benchmark.
+Prepare a B16R16 router for the Value factors and page size used by the HF benchmark.
 
 Prepare `ROUTING_WINDOWS/windows.safetensors` with the
 [mixed routing calibration workflow](../README.md#2-fit-the-page-fisher-router).
-Use the same Value factors and Page4 router for quality and system evaluation.
+Use the same Value factors and router for quality and system evaluation.
+The following example uses Page4. To use Page32, set `--page-size 32` in both
+capture commands, use separate capture/router output directories, and pass
+`--page-size 32 --router-dir PAGE32_ROUTER` to the benchmark.
 
 ```bash
 python -m calibration.router moments --model MODEL --value-factors FACTORS \
@@ -206,13 +214,13 @@ python -m benchmarks.tp --arm dense --model MODEL \
 
 # Table 3: all K/V resident, dense V, three trials per context.
 python -m benchmarks.decode --arm basis --model MODEL \
-  --router-dir PAGE4_V128_ROUTER --tokens TOKENS.safetensors \
+  --page-size 4 --router-dir PAGE4_V128_ROUTER --tokens TOKENS.safetensors \
   --contexts 24576 32768 49152 65536 98304 131072 --output OUTPUT.json
 
 # Figure 4: one point of the context/batch sweep per invocation.
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   -m benchmarks.memory --arm basis --model MODEL \
-  --value-factors FACTORS --router-dir PAGE4_ROUTER \
+  --value-factors FACTORS --page-size 4 --router-dir PAGE4_ROUTER \
   --tokens TOKENS.safetensors --context 65536 --batch-size 8 --output OUTPUT.json
 ```
 

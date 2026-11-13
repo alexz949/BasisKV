@@ -54,7 +54,7 @@ def selected_support(scores, page_size, routed_tokens, recent_tokens=64, pinned_
     """Historical page budget plus an additional exact recent tail.
 
     `pinned_pages` leading pages are always selected and count toward the page budget,
-    as in the paper's older Page32 control; the main protocol pins none.
+    as in the Appendix Table 8 Page32 control; the main protocol pins none.
     """
     batch, groups, heads, length = scores.shape
     if length <= routed_tokens + recent_tokens:

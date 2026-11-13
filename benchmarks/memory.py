@@ -5,7 +5,7 @@ import os
 from datetime import timedelta
 
 from benchmarks.common import add_model_arguments, arguments, distribution, load_model, metadata, prompts, save
-from kernels.routing_config import PAGE_SIZE, PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
+from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def summarize(ranks, batch, steps):
@@ -47,7 +47,7 @@ def main():
         rank=rank, world=world, host_keys=args.arm == 'basis')
     prompt = prompts(args.tokens, args.batch_size, args.context)
     result = dict(schema='basiskv.benchmark.memory.v1', status='running', arguments=arguments(args), environment=metadata(), trials=[],
-        protocol=dict(tp=world, page_size=PAGE_SIZE, pinned_pages=PINNED_PAGES,
+        protocol=dict(tp=world, page_size=args.page_size, pinned_pages=PINNED_PAGES,
             routed_tokens=ROUTED_TOKENS, recent_tokens=RECENT_TOKENS, support_tokens=SUPPORT,
             key_placement='pinned_host_with_gpu_slots' if args.arm == 'basis' else 'gpu',
             memory='Peak PyTorch allocated bytes during steady decode, maximum across ranks; excludes prefill peaks. Compact Value factors store Base inside V; residual codes and selected-Key slots are included.',

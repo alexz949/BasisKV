@@ -1,6 +1,6 @@
 """Shared resident and host-Key attention for the decode and memory benchmarks.
 
-CUDA routing uses GQA4 / QK128 / Page4 / B16R16, no pinned prefix, and
+CUDA routing uses GQA4 / QK128 / B16R16 with 1–32-token power-of-two pages, no pinned prefix, and
 2,048 historical tokens plus 64 recent tokens. Value factors use core.fit_value.
 """
 
@@ -15,11 +15,11 @@ from torch.nn.attention.bias import causal_lower_right
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from inference.model import router_factors
+from core.router import align_value_basis
 from inference.tp import ChunkedTokenwise, fold_value_weight, head_slices, load_layer, load_manifest
 from kernels.allgather import AllGather
-from kernels.decode import PAGE_SIZE, load_paged_attention, load_router
-from kernels.sparse_attention import sparse_attention
-from kernels.routing_config import PINNED_PAGES, ROUTED_PAGES, RECENT_TOKENS, SUPPORT
+from kernels.decode import load_paged_attention, load_router
+from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 SPLITS = 16
 
@@ -30,11 +30,12 @@ def local_weight(weight):
 
 class Attention(nn.Module):
     def __init__(self, original, *, batch, capacity, heads, groups, encoder, decoder,
-                 factors, router, paged, communicator, shared_rope, host_keys):
+                 factors, router, paged, communicator, shared_rope, host_keys, page_size):
         super().__init__()
         self.heads, self.groups, self.dim = heads, groups, original.head_dim
         self.width = self.dim if encoder is None else encoder.shape[-1]
         self.capacity, self.length = capacity, 0
+        self.page_size = page_size
         self.scaling = original.scaling
         self.q_norm = getattr(original, 'q_norm', nn.Identity())
         self.k_norm = getattr(original, 'k_norm', nn.Identity())
@@ -59,7 +60,7 @@ class Attention(nn.Module):
             self.decode_plan = communicator.prepare(heads * self.width, tokens=batch, dtype=dtype)
             self.output = self.decode_plan.local.T.view(batch, heads, 1, self.width)
         if router is None:
-            self.page_ids = torch.arange(math.ceil(capacity / PAGE_SIZE), device=device)[None, None].expand(batch, groups, -1).contiguous()
+            self.page_ids = torch.arange(math.ceil(capacity / self.page_size), device=device)[None, None].expand(batch, groups, -1).contiguous()
             self.dense_workspace = torch.empty(batch * heads, SPLITS, self.width + 2, device=device, dtype=torch.float32)
         else:
             self.partial = torch.empty(batch, heads, SPLITS, self.width, device=device, dtype=torch.float32)
@@ -67,8 +68,8 @@ class Attention(nn.Module):
             self.base_cache = self.value_cache[..., :16] if self.base_in_value else torch.empty(*shape, 16, device=device, dtype=dtype)
             self.residual_cache = torch.empty_like(self.base_cache)
             self.query_code = torch.empty(batch, groups, 4, 16, device=device, dtype=dtype)
-            self.scores = torch.empty(batch, groups, 4, math.ceil(capacity / PAGE_SIZE), device=device)
-            self.pages = torch.empty(batch, groups, ROUTED_PAGES, device=device, dtype=torch.long)
+            self.scores = torch.empty(batch, groups, 4, math.ceil(capacity / self.page_size), device=device)
+            self.pages = torch.empty(batch, groups, ROUTED_TOKENS // self.page_size, device=device, dtype=torch.long)
             self.selection_scratch = torch.empty(batch, groups, router.selection_workspace_size(), device=device, dtype=torch.float32)
             self.support_ids = torch.empty(batch, groups, SUPPORT, device=device, dtype=torch.long)
             if host_keys:
@@ -134,10 +135,12 @@ class Attention(nn.Module):
     def decode_attention(self, query, end):
         if self.router is None:
             return self.paged.attention(self.key_cache, query, self.value_cache,
-                self.page_ids[:, :, :math.ceil(end / PAGE_SIZE)], self.dense_workspace, self.output,
+                self.page_ids[:, :, :math.ceil(end / self.page_size)], self.dense_workspace, self.output,
                 end, self.scaling, SPLITS)
+        from kernels.sparse_attention import sparse_attention
+
         historical = end - RECENT_TOKENS
-        scores = self.scores[..., :math.ceil(historical / PAGE_SIZE)]
+        scores = self.scores[..., :math.ceil(historical / self.page_size)]
         f = self.factors
         self.router.page_lse(query, self.base_cache[:, :, :historical], self.residual_cache[:, :, :historical],
             f['base_right_b16'], f['base_bias_b16'], f['residual_query_b16_r16'],
@@ -227,9 +230,9 @@ def install(model, args, *, batch, capacity, rank=0, world=1, host_keys=False):
     router = paged = communicator = None
     if args.arm == 'basis':
         assert args.router_dir is not None and local_heads == local_groups * 4, 'basis needs --router-dir and the GQA-4 kernel build'
-        router = load_router(width)
+        router = load_router(width, page_size=args.page_size)
     else:
-        paged = load_paged_attention(width, local_heads // local_groups)
+        paged = load_paged_attention(width, local_heads // local_groups, page_size=args.page_size)
     if manifest is not None and world > 1:
         communicator = AllGather.from_distributed(device=next(model.parameters()).device)
         communicator.configure_workspace(tokens=batch * min(capacity, 2048), max_total_width=geometry['num_heads'] * width, dtype=torch.bfloat16)
@@ -244,16 +247,15 @@ def install(model, args, *, batch, capacity, rank=0, world=1, host_keys=False):
             payload, protocol = router_factors(args.router_dir, index)
             base, residual = protocol['base_rank'], protocol['residual_rank']
             assert base == residual == 16, 'the register router kernel is compiled for B16R16'
-            assert protocol['page_size'] == PAGE_SIZE and protocol['excluded_prefix_pages'] == PINNED_PAGES
+            assert protocol['page_size'] == args.page_size and protocol['excluded_prefix_pages'] == PINNED_PAGES
             assert protocol['excluded_recent_tokens'] == RECENT_TOKENS
             if encoder is not None:
-                # The paper stores Base inside V: T=[L,Q_perp], c'=cT and D'=T^-1 D.
+                # Orthogonal Value rotation: c'=cQ, D'=Q^T D; the first 16 coordinates supply Base.
                 left = payload['base_left_b16'].double()
-                orthogonal, _ = torch.linalg.qr(left, mode='complete')
-                transform = torch.cat((left, orthogonal[..., 16:]), dim=-1)
-                inverse = torch.linalg.inv(transform)
-                encoder = (encoder.double() @ transform[groups].to(encoder.device)).to(encoder.dtype)
-                decoder = (inverse.repeat_interleave(config.num_attention_heads // config.num_key_value_heads, dim=0).to(decoder.device) @ decoder.double()).to(decoder.dtype)
+                rotation, right = align_value_basis(left, payload['base_right_b16'].double())
+                encoder = (encoder.double() @ rotation[groups].to(encoder.device)).to(encoder.dtype)
+                decoder = (rotation.mT.repeat_interleave(config.num_attention_heads // config.num_key_value_heads, dim=0).to(decoder.device) @ decoder.double()).to(decoder.dtype)
+                payload['base_right_b16'] = right
                 selector = torch.zeros_like(left)
                 selector[:, :16] = torch.eye(16, dtype=selector.dtype)
                 payload['base_left_b16'] = selector
@@ -261,7 +263,7 @@ def install(model, args, *, batch, capacity, rank=0, world=1, host_keys=False):
                        for name, tensor in payload.items() if name in ('base_left_b16', 'base_right_b16', 'base_bias_b16', 'residual_encoder_b16_r16', 'residual_query_b16_r16')}
         attention = Attention(layer.self_attn, batch=batch, capacity=capacity, heads=local_heads, groups=local_groups,
             encoder=encoder, decoder=decoder, factors=factors, router=router, paged=paged,
-            communicator=communicator, shared_rope=shared_rope, host_keys=host_keys)
+            communicator=communicator, shared_rope=shared_rope, host_keys=host_keys, page_size=args.page_size)
         layer.self_attn = attention
         layer.input_layernorm = ChunkedTokenwise(layer.input_layernorm, chunk_size=2048)
         layer.forward = MethodType(decoder_layer_forward, layer)

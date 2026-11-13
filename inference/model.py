@@ -1,4 +1,4 @@
-"""Load a local model and install current BasisKV Value and router factors."""
+"""Load a local model and install BasisKV Value and router factors."""
 from pathlib import Path
 import torch
 from safetensors.torch import load_file
@@ -56,12 +56,12 @@ def install_value_factors(model, directory):
 def install_factors(model, *, value_factors=None, gated_value_bank=None, gdn_bank=None):
     """The same installation path is used by calibration and quality evaluation."""
     if model.config.model_type.startswith('qwen3_5'):
-        from inference.qwen35 import GatedVRuntime, Qwen35PrivateAGRuntime, load_bank
+        from inference.qwen35 import GatedVRuntime, GDNRuntime, load_bank
         assert value_factors is None, 'Qwen3.5 uses its separate gated-V objective'
         if gated_value_bank is not None:
             GatedVRuntime(model, load_bank(gated_value_bank)['layers']).install()
         if gdn_bank is not None:
-            Qwen35PrivateAGRuntime(model, gdn_bank).install()
+            GDNRuntime(model, gdn_bank).install()
     else:
         assert gated_value_bank is None and gdn_bank is None, 'gated-V and GDN banks are Qwen3.5 artifacts'
         if value_factors is not None:

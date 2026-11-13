@@ -4,7 +4,7 @@ import argparse
 import statistics
 
 from benchmarks.common import add_model_arguments, arguments, load_model, metadata, prompts, save
-from kernels.routing_config import PAGE_SIZE, PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
+from kernels.routing_config import PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
     capacity = max(args.contexts) + args.warmup_steps + max(args.decode_steps, args.profile_steps)
     layers, _ = install(model, args, batch=1, capacity=capacity)
     result = dict(schema='basiskv.benchmark.decode.v1', status='running', arguments=arguments(args), environment=metadata(), contexts=[],
-        protocol=dict(tp=1, batch=1, key_placement='gpu', value_placement='gpu', page_size=PAGE_SIZE,
+        protocol=dict(tp=1, batch=1, key_placement='gpu', value_placement='gpu', page_size=args.page_size,
             pinned_pages=PINNED_PAGES, routed_tokens=ROUTED_TOKENS, recent_tokens=RECENT_TOKENS,
             support_tokens=SUPPORT, timing='Prefill excluded; CUDA-event full-model decode. Attention includes append, routing, and attention, excludes QKV/O projection. Separate attribution run.'))
     for length in args.contexts:

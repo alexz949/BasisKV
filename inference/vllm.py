@@ -13,7 +13,7 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from inference.backends import c1_diffkv_backend, paged_backend
+from inference.backends import joint_value_diffkv_backend, paged_backend
 from core.model_layout import ValueGeometry
 from inference.tp import fold_value_weight, head_slices, layer_ranks, load_layer, load_manifest, single_kv_head_layout
 from kernels.allgather import AllGather
@@ -31,8 +31,8 @@ def factor_configuration(vllm_config):
     config = vllm_config.model_config.hf_config
     group = get_tp_group()
     check_supported(vllm_config)
-    root = Path(config.basiskv_c1_factor_dir).expanduser().resolve()
-    validation = getattr(config, 'basiskv_c1_validation', 'sha256')
+    root = Path(config.basiskv_joint_value_factor_dir).expanduser().resolve()
+    validation = getattr(config, 'basiskv_joint_value_validation', 'sha256')
     manifest = load_manifest(root)
     geometry = manifest['fit_config']['geometry']
     assert ValueGeometry.from_config(config, range(config.num_hidden_layers)).to_dict() == geometry, (
@@ -41,7 +41,7 @@ def factor_configuration(vllm_config):
     return root, manifest, validation
 
 
-class C1QKVParallelLinear(QKVParallelLinear):
+class JointValueQKVParallelLinear(QKVParallelLinear):
     def __init__(self, encoder, prefix, hidden_size, num_query_heads, num_kv_heads):
         _, dim, rank = encoder.shape
         super().__init__(hidden_size, dim, num_query_heads, num_kv_heads,
@@ -73,7 +73,7 @@ class C1QKVParallelLinear(QKVParallelLinear):
             super().weight_loader(param, loaded_weight, loaded_shard_id)
 
 
-class C1Attention(nn.Module):
+class JointValueAttention(nn.Module):
     """Compact-Value attention of one TP rank, built from the native Llama or Qwen3 attention.
 
     Both models keep their own rotary module. Qwen3 normalizes Q and K per head before RoPE; Llama
@@ -90,17 +90,17 @@ class C1Attention(nn.Module):
         name = native.attn.layer_name
         config.compilation_config.static_forward_context.pop(name)
         hf = config.model_config.hf_config
-        self.qkv_proj = C1QKVParallelLinear(encoder, name[:-5] + '.qkv_proj',
+        self.qkv_proj = JointValueQKVParallelLinear(encoder, name[:-5] + '.qkv_proj',
                                           hf.hidden_size, hf.num_attention_heads, hf.num_key_value_heads)
         self.q_norm, self.k_norm = (native.q_norm, native.k_norm) if hf.model_type == 'qwen3' else (nn.Identity(), nn.Identity())
         self.rotary_emb = native.rotary_emb
         self.calls = 0  # Python-level executions: every eager step and each CUDA Graph capture
-        backend = c1_diffkv_backend(self.value_rank) if boundary is not None else paged_backend(self.value_rank)
+        backend = joint_value_diffkv_backend(self.value_rank) if boundary is not None else paged_backend(self.value_rank)
         self.attn = Attention(self.num_heads, self.head_dim, native.scaling, num_kv_heads=self.num_kv_heads,
             cache_config=config.cache_config, prefix=name, attn_backend=backend, head_size_v=self.value_rank)
         self.register_buffer('decoder', decoder.flatten(0, 1), persistent=False)
         if boundary is not None:
-            object.__setattr__(self.attn, '_basiskv_c1_output', boundary)
+            object.__setattr__(self.attn, '_basiskv_joint_value_output', boundary)
 
     def forward(self, positions, hidden_states):
         self.calls += 1
@@ -111,7 +111,7 @@ class C1Attention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.num_kv_heads, self.head_dim)).reshape(-1, ksize)
         q, k = self.rotary_emb(positions, q, k)
         if self.boundary is not None:
-            return torch.ops.vllm.basiskv_c1_attention_output(q, k, v, self.decoder, self.attn.layer_name)
+            return torch.ops.vllm.basiskv_joint_value_attention_output(q, k, v, self.decoder, self.attn.layer_name)
         # This backend inserts K/V inside forward; the specialized op updates them externally.
         local = self.attn(q, k, v).reshape(-1, self.num_heads * self.value_rank)
         return tensor_model_parallel_all_gather(local, dim=-1) @ self.decoder
@@ -121,7 +121,7 @@ class CompactValueModel:
     """Compact-Value construction shared by the Llama and Qwen3 adapters.
 
     The native vLLM class, next in the MRO, builds the embeddings, norms, MLPs, and LM head and loads
-    their weights. This mixin replaces every attention layer with C1Attention and keeps the dense
+    their weights. This mixin replaces every attention layer with JointValueAttention and keeps the dense
     output projections out of the checkpoint stream; the fitted decoders stand in for them.
     """
 
@@ -143,21 +143,21 @@ class CompactValueModel:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         device = next(self.parameters()).device
         # One communicator serves every layer; its workspace holds the widest layer and each layer gathers its own width.
-        self.c1_boundary = PreparedC1Output(group.device_group, device, geometry['num_heads'] // group.world_size * max(ranks.values()),
+        self.joint_value_boundary = PreparedJointValueOutput(group.device_group, device, geometry['num_heads'] // group.world_size * max(ranks.values()),
             vllm_config.scheduler_config.max_num_batched_tokens) if prepared else None
         for index, layer in enumerate(self.model.layers):
             encoder, decoder = load_layer(root, manifest, index, group.rank_in_group, tp_size=group.world_size,
                 device=device, dtype=torch.bfloat16, validation=validation)
-            layer.self_attn = C1Attention(layer.self_attn, encoder, decoder, self.c1_boundary, vllm_config)
+            layer.self_attn = JointValueAttention(layer.self_attn, encoder, decoder, self.joint_value_boundary, vllm_config)
 
     def load_weights(self, weights):
         dense_outputs = tuple(f'model.layers.{layer}.self_attn.o_proj.' for layer in range(self.config.num_hidden_layers))
         return super().load_weights((name, tensor) for name, tensor in weights if not name.startswith(dense_outputs))
 
-    def c1_statistics(self):
+    def joint_value_statistics(self):
         """Per-layer evidence of the compact path on this rank, read from the installed modules and vLLM's cache tensors."""
         attentions = [layer.self_attn for layer in self.model.layers]
-        stats = self.c1_boundary.statistics() if self.c1_boundary is not None else dict(backend='vllm_allgather', decoder_gemms=1)
+        stats = self.joint_value_boundary.statistics() if self.joint_value_boundary is not None else dict(backend='vllm_allgather', decoder_gemms=1)
         caches = [layer.attn.kv_cache for layer in attentions]
         return stats | dict(model_type=self.model_type, loaded_value_layers=sum(layer.qkv_proj.value_loaded for layer in attentions),
             compact_attention_calls=sum(layer.calls for layer in attentions),
@@ -169,7 +169,7 @@ class CompactValueModel:
             collective_local_widths=[layer.num_heads * layer.value_rank for layer in attentions],
             attention_backends=sorted({layer.attn.attn_backend.get_name() for layer in attentions}),
             attention_impls=sorted({type(layer.attn.impl).__name__ for layer in attentions}),
-            decode_output_layout='feature_major_allgather_slot' if self.c1_boundary is not None else 'token_major',
+            decode_output_layout='feature_major_allgather_slot' if self.joint_value_boundary is not None else 'token_major',
             key_head_size=attentions[0].head_dim, local_query_heads=attentions[0].num_heads, local_kv_heads=attentions[0].num_kv_heads)
 
 
@@ -181,7 +181,7 @@ class BasisKVQwen3ForCausalLM(CompactValueModel, Qwen3ForCausalLM):
     model_type = 'qwen3'
 
 
-class PreparedC1Output:
+class PreparedJointValueOutput:
     """One communicator shared by sequential attention layers.
 
     Plans are warmed on the actual capture stream before capture begins.
@@ -239,19 +239,19 @@ class PreparedC1Output:
     def statistics(self):
         return dict(backend='uniform_nccl', decoder_gemms=1, capture_calls=self.capture_calls, eager_calls=self.eager_calls, direct_decode_calls=self.direct_decode_calls, prepared_shapes=sorted({(int(key[0]), int(key[1])) for key in self.prepared}))
 
-def c1_attention_output(query: Tensor, key: Tensor, value: Tensor, decoder: Tensor, layer_name: str) -> Tensor:
+def joint_value_attention_output(query: Tensor, key: Tensor, value: Tensor, decoder: Tensor, layer_name: str) -> Tensor:
     (attn_metadata, attn_layer, kv_cache, slot_mapping) = get_attention_context(layer_name)
     query = query.view(-1, attn_layer.num_heads, attn_layer.head_size)
     key = key.view(-1, attn_layer.num_kv_heads, attn_layer.head_size)
     value = value.view(-1, attn_layer.num_kv_heads, attn_layer.head_size_v)
     if slot_mapping is not None:
         attn_layer.impl.do_kv_cache_update(attn_layer, key, value, kv_cache, slot_mapping)
-    boundary = attn_layer._basiskv_c1_output
+    boundary = attn_layer._basiskv_joint_value_output
     return boundary.attention(attn_layer, query, key, value, kv_cache, attn_metadata, decoder)
 
-def c1_attention_output_fake(query: Tensor, key: Tensor, value: Tensor, decoder: Tensor, layer_name: str) -> Tensor:
+def joint_value_attention_output_fake(query: Tensor, key: Tensor, value: Tensor, decoder: Tensor, layer_name: str) -> Tensor:
     return query.new_empty((query.shape[0], decoder.shape[1]))
-direct_register_custom_op(op_name='basiskv_c1_attention_output', op_func=c1_attention_output, fake_impl=c1_attention_output_fake)
+direct_register_custom_op(op_name='basiskv_joint_value_attention_output', op_func=joint_value_attention_output, fake_impl=joint_value_attention_output_fake)
 
 
 
@@ -262,8 +262,8 @@ class BasisKVWorkerExtension:
         """Return device-local CUDA statistics for any vLLM model."""
         return {'peak_cuda_allocated_bytes': int(torch.cuda.max_memory_allocated()), 'cuda_device': torch.cuda.get_device_name()}
 
-    def basiskv_c1_statistics(self) -> dict[str, Any]:
-        return self.basiskv_cuda_statistics() | self.get_model().c1_statistics()
+    def basiskv_joint_value_statistics(self) -> dict[str, Any]:
+        return self.basiskv_cuda_statistics() | self.get_model().joint_value_statistics()
 
     def basiskv_profile_start(self) -> None:
         """Profile rank zero only; benchmark timing runs never enable this."""

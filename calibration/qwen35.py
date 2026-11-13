@@ -115,7 +115,7 @@ def fit(args):
             sweeps=args.sweeps,cg_iterations=args.cg_iterations,work_dtype=torch.float32)
         records.append(dict(layer_index=layer,private_encoders=encoder.cpu().to(torch.bfloat16),
             joint_decoder_weight=decoder.flatten(0,1).T.cpu().to(torch.bfloat16)))
-    torch.save(dict(format='basiskv.qwen35.gdn_private_ag_joint_factors.v2', schema_version=1,layers=records),args.output / 'gdn.pt')
+    torch.save(dict(format='basiskv.qwen35.gdn_factors.v1', schema_version=1,layers=records),args.output / 'gdn.pt')
 
 
 def main():

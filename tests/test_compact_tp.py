@@ -4,7 +4,7 @@ Uniform banks and a per-layer (`core.allocate`-style) bank are served. Every ten
 BasisKVQwen3ForCausalLM), built and weight-loaded by vLLM's own code. The ranks run as threads of one
 process and exchange tensors through an in-process stand-in for the TP group, so the sharded
 embeddings, MLPs, LM head, Q/K/V projections, norms, RoPE, Value folding, and decoders are the
-production ones. Two CUDA pieces are replaced and are covered by the GPU smoke instead: the paged
+production ones. Two CUDA pieces are replaced for this CPU test: the paged
 attention kernels (here a plain softmax attention over a [K | compact V] cache) and the NCCL
 AllGather arena (here a concatenation). The models run in FP32 so that the comparison is tight.
 
@@ -93,7 +93,7 @@ class ReferenceAttention(nn.Module):
 
 
 class ConcatenatingBoundary:
-    """Emulate PreparedC1Output with in-process concatenation and the same call contract."""
+    """Emulate PreparedJointValueOutput with in-process concatenation and the same call contract."""
 
     def __init__(self, group, device, max_local_width, max_tokens):
         self.max_local_width = max_local_width
@@ -154,7 +154,7 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
     from vllm.config import CompilationConfig, DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.model_loader.utils import get_model_architecture
 
-    overrides = dict(architectures=[architecture], basiskv_c1_factor_dir=str(factors), basiskv_c1_validation='sha256')
+    overrides = dict(architectures=[architecture], basiskv_joint_value_factor_dir=str(factors), basiskv_joint_value_validation='sha256')
     model_config = ModelConfig(model=str(model_dir), dtype='bfloat16', seed=0, hf_overrides=overrides)
     # As in benchmarks.tp, the model runs without torch.compile. vLLM's compiled CUDA operators (RoPE, RMSNorm,
     # SiLU) do not exist on CPU, so its own PyTorch-native implementations of them are selected.
@@ -184,7 +184,7 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
         if attention.boundary is None:
             attention.attn = reference
         else:
-            object.__setattr__(reference, '_basiskv_c1_output', attention.boundary)
+            object.__setattr__(reference, '_basiskv_joint_value_output', attention.boundary)
             references[group.rank_in_group, real.layer_name] = reference
     return model
 
@@ -204,14 +204,14 @@ def serve(kind, bank, world_size, root):
     # The native attention layers are replaced by the adapter; they only need some backend class to construct.
     attention_layer.get_attn_backend = lambda head_size, *args, **kwargs: paged_backend(head_size)
     references = {}
-    adapter.PreparedC1Output = ConcatenatingBoundary
+    adapter.PreparedJointValueOutput = ConcatenatingBoundary
     adapter.get_attention_context = lambda name: (None, references[group.rank_in_group, name], None, None)
     prepared = single_kv_head_layout(ValueGeometry.from_factors(factors).to_dict(), world_size)
     models = []
     for index in range(world_size):
         group.local.rank = index
         models.append(build_rank(model_dir, factors, COMPACT_ARCHITECTURES[kind], group, references, chunked_prefill=prepared))
-    assert all((model.c1_boundary is not None) == prepared for model in models)
+    assert all((model.joint_value_boundary is not None) == prepared for model in models)
 
     tokens = torch.randint(0, VOCAB, (PREFILL + DECODE,), generator=torch.Generator().manual_seed(sum(ranks) + world_size))
     # The DiffKV layout takes the prompt in two chunks, the second attending to the cached first; the paged
@@ -248,8 +248,8 @@ def serve(kind, bank, world_size, root):
             assert cache.values.shape == (PREFILL + DECODE, KV_HEADS // world_size, rank), 'a cached Value does not have its layer rank'
             assert layer.self_attn.decoder.shape == (HEADS * rank, HIDDEN)
         if prepared:  # each layer gathered its own width, in layer order, on every step
-            assert model.c1_boundary.gathered_widths == [HEADS * rank for rank in ranks] * len(steps), 'a collective did not carry its layer width'
-            assert model.c1_boundary.max_local_width == local_heads * max(ranks)
+            assert model.joint_value_boundary.gathered_widths == [HEADS * rank for rank in ranks] * len(steps), 'a collective did not carry its layer width'
+            assert model.joint_value_boundary.max_local_width == local_heads * max(ranks)
 
     reference = install_factors(AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32, local_files_only=True).eval(),
                                 value_factors=factors)

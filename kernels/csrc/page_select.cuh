@@ -1,12 +1,14 @@
-// Exact Page4 GQA-max top-k selection. Included inside the router namespace.
+// Exact GQA-max top-k selection. Included inside the router namespace.
 // Group maxima prune only groups that cannot contain a top-k page. Ties select
 // the lowest page IDs. Scratch is supplied by the benchmark and reused per step.
 
 constexpr int kSelectThreads = 1024;
 constexpr int kGroupPages = 8;
 constexpr int kGroupThreads = 256;
-constexpr int kMaxGroups = 8192;  // 262K tokens, including decode growth beyond 128K
-constexpr int kMaxGroupBlocks = kMaxGroups / kGroupThreads;
+constexpr int kMaxHistoricalTokens = 262144;  // includes decode growth beyond 128K
+constexpr int kMaxPages = (kMaxHistoricalTokens + kPageSize - 1) / kPageSize;
+constexpr int kMaxGroups = (kMaxPages + kGroupPages - 1) / kGroupPages;
+constexpr int kMaxGroupBlocks = (kMaxGroups + kGroupThreads - 1) / kGroupThreads;
 constexpr int kRoutedPages = BASIS_ROUTED_TOKENS / kPageSize;
 constexpr int kPinnedPages = 0;
 constexpr int kNeededPages = kRoutedPages - kPinnedPages;

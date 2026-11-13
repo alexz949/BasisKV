@@ -214,8 +214,9 @@ python -m eval.ruler --model MODEL --value-factors outputs/value \
 
 Main quality evaluation uses Page4 without a pinned prefix: RULER selects
 2,048 historical tokens plus 64 recent tokens (2,112 total), and LongBench
-selects 256 plus 64 (320 total). CUDA routing benchmarks use the same Page4,
-no-sink configuration as RULER, with 2,048 selected historical tokens and 64
+selects 256 plus 64 (320 total). CUDA routing benchmarks default to the same
+Page4, no-sink configuration as RULER and accept `--page-size {1,2,4,8,16,32}`,
+independently of Value rank. Both use 2,048 selected historical tokens and 64
 recent tokens. See the benchmark guide for system commands and the appendix
 guide for table-specific evaluation commands.
 
