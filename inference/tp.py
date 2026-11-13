@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from core.factor_io import DECODER_KEY, ENCODER_KEY, FORMAT, read_layer
+from core.factor_io import DECODER_KEY, ENCODER_KEY, FORMAT, read_layer, shared_config
 from core.router_io import read_json
 
 
@@ -13,8 +13,13 @@ def load_manifest(root):
     root = Path(root)
     manifest = read_json(root / 'results.json')
     assert manifest['format'] == FORMAT and manifest['status'] == 'complete', f'{root} is not a complete Value-factor bank'
-    assert 'cache_rank_per_head' in manifest['fit_config'], 'TP inference uses a uniform-rank bank, not an allocated one'
+    assert len(manifest['layer_ranks']) == len(manifest['layers']), f'{root} does not record one rank per fitted layer'
     return manifest
+
+
+def layer_ranks(manifest):
+    """Value rank of every fitted layer: one constant for a `core.fit_value` bank, the schedule of a `core.allocate` bank."""
+    return dict(zip(manifest['layers'], manifest['layer_ranks']))
 
 
 def head_slices(geometry, tp_rank, tp_size):
@@ -34,11 +39,18 @@ def load_layer(root, manifest, layer, tp_rank, *, tp_size, device, dtype, valida
     fit = manifest['fit_config']
     geometry = fit['geometry']
     artifact = manifest['artifacts'][str(layer)]
+    rank = layer_ranks(manifest)[layer]
     if validation == 'sha256':
-        record = read_layer(root, layer, fit)
+        # An allocated bank keeps each layer's own fit record; only the rank may differ from the shared configuration.
+        record = read_layer(root, layer, None)
         assert record is not None and record['artifact'] == artifact, f'layer {layer} of {root} is missing or corrupt'
+        assert (shared_config(record['fit_config']) == shared_config(fit) and record['fit_config']['cache_rank_per_head'] == rank), (
+            f'layer {layer} of {root} was fitted with another configuration or rank')
     payload = load_file(str(root / artifact['file']))
     encoder, decoder = payload[ENCODER_KEY], payload[DECODER_KEY]
+    assert (tuple(encoder.shape) == (geometry['num_kv_heads'], geometry['head_dim'], rank)
+            and tuple(decoder.shape) == (geometry['num_heads'], rank, geometry['hidden_size'])), (
+        f'layer {layer} of {root} does not hold rank-{rank} factors for the recorded geometry')
     groups, _ = head_slices(geometry, tp_rank, tp_size)
     # Head-major AllGather order matches the replicated decoder's first axis.
     return (encoder[groups].to(device=device, dtype=dtype).contiguous(),

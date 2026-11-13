@@ -220,7 +220,8 @@ def install(model, args, *, batch, capacity, rank=0, world=1, host_keys=False):
     local_heads, local_groups = heads.stop - heads.start, groups.stop - groups.start
     assert not host_keys or args.arm == 'basis', 'host-resident Keys belong to the basis arm'
     manifest = load_manifest(args.value_factors) if args.value_factors else None
-    width = config.head_dim if manifest is None else manifest['fit_config']['cache_rank_per_head']
+    assert manifest is None or len(set(manifest['layer_ranks'])) == 1, 'the HF TP runtime serves uniform-rank banks; benchmarks.tp serves allocated ones'
+    width = config.head_dim if manifest is None else manifest['layer_ranks'][0]
     assert width in (64, 96, 128), 'the router kernel is compiled for Value widths 64, 96, and 128'
     router = paged = communicator = None
     if args.arm == 'basis':

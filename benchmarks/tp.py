@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Figure 3: vLLM cohort throughput, TTFT, and TPOT for Llama and Qwen3 (dense, or compact V64/V96)."""
+"""Figure 3: vLLM cohort throughput, TTFT, and TPOT for Llama and Qwen3 (dense, or compact Value with uniform or per-layer ranks)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import shlex
 import sys
 import time
 
-from core.factor_io import write_json
+from core.factor_io import sha256, write_json
 from core.router_io import read_json
 from inference.tp import load_manifest, single_kv_head_layout
 from inference import COMPACT_ARCHITECTURES, register
@@ -50,6 +50,22 @@ def run_batch(llm, prompts, sampling, decode_tokens):
                 tpot_ms=distribution([row["tpot_ms"] for row in requests]), requests=requests)
 
 
+def factor_record(root, manifest):
+    """What the compact arm serves: the rank schedule, its retention, and fingerprints of the factor files."""
+    geometry, ranks = manifest["fit_config"]["geometry"], list(manifest["layer_ranks"])
+    head_dim, kv_heads, mean = geometry["head_dim"], geometry["num_kv_heads"], sum(ranks) / len(ranks)
+    return dict(
+        directory=str(root), schedule="uniform" if len(set(ranks)) == 1 else "adaptive", layer_ranks=ranks, mean_rank=mean,
+        value_retention=mean / head_dim, kv_retention=(head_dim + mean) / (2 * head_dim),
+        # BF16 bytes one token occupies across all layers and KV heads: every layer keeps a 128-wide Key and its own Value rank.
+        logical_cache_bytes_per_token=sum(2 * kv_heads * (head_dim + rank) for rank in ranks),
+        dense_cache_bytes_per_token=2 * kv_heads * 2 * head_dim * len(ranks),
+        results_sha256=sha256(root / "results.json"),
+        layer_sha256={layer: artifact["sha256"] for layer, artifact in manifest["artifacts"].items()},
+        allocation={key: manifest["allocation"][key] for key in ("method", "target_average_rank", "candidate_ranks")
+                    if key in manifest.get("allocation", {})})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", choices=("dense", "basis"), required=True)
@@ -76,12 +92,16 @@ def main():
     assert (args.value_factors is not None) == (args.arm == "basis"), "basis takes --value-factors; dense does not"
     source_prompts = prompts(args.tokens, max(args.batch_sizes), args.prefill_tokens).tolist()
     # The adapter follows the checkpoint's own configuration; dense keeps the model's native vLLM architecture.
-    model_type = read_json(args.model.resolve() / "config.json")["model_type"]
-    layers, rank, overrides = None, None, {}
+    model_path = args.model.resolve()
+    model_type = read_json(model_path / "config.json")["model_type"]
+    model = dict(path=str(model_path), model_type=model_type, config_sha256=sha256(model_path / "config.json"),
+                 revision=model_path.name if model_path.parent.name == "snapshots" else None)
+    ranks, factors, overrides = None, None, {}
     if args.arm == "basis":
         root = args.value_factors.resolve()
-        fit = load_manifest(root)["fit_config"]
-        layers, rank = fit["geometry"]["num_layers"], fit["cache_rank_per_head"]
+        manifest = load_manifest(root)
+        fit, ranks, factors = manifest["fit_config"], list(manifest["layer_ranks"]), factor_record(root, manifest)
+        local_heads = fit["geometry"]["num_heads"] // args.tp_size
         assert model_type in COMPACT_ARCHITECTURES and fit["geometry"]["model_type"] == model_type, (
             f"compact Value serving covers {sorted(COMPACT_ARCHITECTURES)} checkpoints with factors fitted for the same model; "
             f"got a {model_type} model and {fit['geometry']['model_type']} factors")
@@ -115,6 +135,7 @@ def main():
         command=shlex.join([sys.executable, *sys.argv]), conda_environment=os.environ.get("CONDA_DEFAULT_ENV", sys.prefix),
         torch=torch.__version__, torch_cuda=torch.version.cuda, vllm=vllm.__version__,
         transformers=transformers.__version__, triton=triton.__version__, model_type=model_type,
+        model=model, value_factors=factors,
         git_head=command(["git", "rev-parse", "HEAD"])["stdout"].strip(),
         git_status=command(["git", "status", "--short"])["stdout"],
         factor_validation=args.factor_validation, configuration=configuration,
@@ -154,9 +175,12 @@ def main():
                                   ttft_ms=measured["ttft_ms"], tpot_ms=measured["tpot_ms"])), flush=True)
         row["workers"] = llm.collective_rpc("basisserve_c1_statistics" if args.arm == "basis" else "basisserve_cuda_statistics")
         if args.arm == "basis":
-            # Every rank loaded all factors, holds a cache whose Value width is the fitted rank, and executed
-            # the compact attention during this batch size (prefill always runs it eagerly).
-            assert all(worker["loaded_value_layers"] == layers and worker["cache_value_widths"] == [rank]
+            # Layer by layer, every rank loaded the scheduled factors, holds a cache tensor whose Value width is that
+            # layer's rank, and gathered exactly that layer's width; it also executed the compact attention during
+            # this batch size (prefill always runs it eagerly).
+            assert all(worker["loaded_value_layers"] == len(ranks) and worker["layer_value_ranks"] == ranks
+                       and worker["cache_value_widths"] == ranks
+                       and {width for width, _ in worker["prepared_shapes"]} == {local_heads * rank for rank in ranks}
                        and worker["compact_attention_calls"] > before
                        for worker, before in zip(row["workers"], compact_calls, strict=True)), "a worker did not run the compact-Value path"
             compact_calls = [worker["compact_attention_calls"] for worker in row["workers"]]

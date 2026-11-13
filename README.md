@@ -62,6 +62,8 @@ python -m core.fit_value merge --output-dir outputs/value
 
 For layerwise rank allocation, fit uniform banks at candidate ranks, collect
 KL probes with `calibration.probe_kl`, then select ranks with `core.allocate`.
+The directory it writes is used like a uniform bank, including by the
+tensor-parallel benchmark (`benchmarks.tp`), which serves each layer at its own rank.
 Use `python -m <module> --help` for each entrypoint's options.
 
 ### 2. Fit the Page-Fisher router

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vLLM's triton_unified_attention_diffkv.py (vLLM contributors).
-"""Paged causal prefill for QK128 GQA with compact Values (64 or 96 wide).
+"""Paged causal prefill for QK128 GQA with compact Values (any width up to 128).
 
 Reuse upstream sequence lookup and online softmax, with a dedicated causal
 prefill loop. BLOCK_M counts (query token, GQA head) pairs, not tokens.
@@ -73,8 +73,8 @@ def diffkv_prefill_kernel(
 def _launch_config(
     group, value_dim, num_seqs, max_query_len, max_sequence_length
 ):
-    assert value_dim in (64, 96)
-    if value_dim == 96:
+    # Tile shapes follow the padded Value block (64 or 128 wide); they were tuned at V64 and V96.
+    if value_dim > 64:
         if max_query_len is not None and max_query_len <= 128:
             return (32, 128, 8, 2)
         if (
@@ -98,7 +98,7 @@ def diffkv_prefill(q, k, v, out, cu_seqlens_q, seqused_k, block_table,
                   max_sequence_length=None, block_m=None, block_n=None,
                   num_warps=None, num_stages=None):
     value_dim = int(v.shape[-1])
-    assert q.shape[-1] == k.shape[-1] == 128 and value_dim in (64, 96)
+    assert q.shape[-1] == k.shape[-1] == 128 and 0 < value_dim <= 128
     assert k.shape[2] == 1 and q.shape[1] in (4, 8)
     assert out.shape[1:] == (q.shape[1], value_dim)
     group = q.shape[1]

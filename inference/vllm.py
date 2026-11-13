@@ -17,7 +17,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from inference.backends import c1_diffkv_backend, paged_backend
 from inference.qwen35 import Qwen35PrivateAGOutput, load_bank
 from core.model_layout import ValueGeometry
-from inference.tp import folded_projection_weights, fold_value_weight, head_slices, load_layer, load_manifest, single_kv_head_layout
+from inference.tp import folded_projection_weights, fold_value_weight, head_slices, layer_ranks, load_layer, load_manifest, single_kv_head_layout
 from kernels.allgather import AllGather
 
 def check_supported(vllm_config, *, single_gpu=False):
@@ -136,14 +136,17 @@ class CompactValueModel:
         root, manifest, validation = factor_configuration(vllm_config)
         group = get_tp_group()
         geometry = manifest['fit_config']['geometry']
-        rank = manifest['fit_config']['cache_rank_per_head']
+        ranks = layer_ranks(manifest)
+        assert set(ranks) == set(range(config.num_hidden_layers)) and all(0 < rank <= geometry['head_dim'] for rank in ranks.values()), (
+            f'{root} does not give every layer a Value rank between 1 and {geometry["head_dim"]}')
         prepared = single_kv_head_layout(geometry, group.world_size)
         assert prepared or not vllm_config.scheduler_config.enable_chunked_prefill, (
             'chunked prefill needs the DiffKV kernels, which serve one KV head and 4 or 8 query heads per rank; '
             'disable chunked prefill for this tensor-parallel size')
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         device = next(self.parameters()).device
-        self.c1_boundary = PreparedC1Output(group.device_group, device, geometry['num_heads'] // group.world_size * rank,
+        # One communicator serves every layer; its workspace holds the widest layer and each layer gathers its own width.
+        self.c1_boundary = PreparedC1Output(group.device_group, device, geometry['num_heads'] // group.world_size * max(ranks.values()),
             vllm_config.scheduler_config.max_num_batched_tokens) if prepared else None
         for index, layer in enumerate(self.model.layers):
             encoder, decoder = load_layer(root, manifest, index, group.rank_in_group, tp_size=group.world_size,
@@ -155,19 +158,22 @@ class CompactValueModel:
         return super().load_weights((name, tensor) for name, tensor in weights if not name.startswith(dense_outputs))
 
     def c1_statistics(self):
+        """Per-layer evidence of the compact path on this rank, read from the installed modules and vLLM's cache tensors."""
         attentions = [layer.self_attn for layer in self.model.layers]
-        attention = attentions[0]
         stats = self.c1_boundary.statistics() if self.c1_boundary is not None else dict(backend='vllm_allgather', decoder_gemms=1)
-        # Read Value widths from the KV cache tensors allocated by vLLM.
-        widths = sorted({int(layer.attn.kv_cache.shape[-1]) - layer.head_dim for layer in attentions})
+        caches = [layer.attn.kv_cache for layer in attentions]
         return stats | dict(model_type=self.model_type, loaded_value_layers=sum(layer.qkv_proj.value_loaded for layer in attentions),
             compact_attention_calls=sum(layer.calls for layer in attentions),
-            kv_cache_shape=list(attention.attn.kv_cache.shape), cache_value_widths=widths,
-            attention_backend=attention.attn.attn_backend.get_name(), attention_impl=type(attention.attn.impl).__name__,
-            prefill_specialization=f'qk{attention.head_dim}_v{attention.value_rank}',
-            decode_specialization=f'qk{attention.head_dim}_v{attention.value_rank}_h{attention.num_heads}',
+            layer_value_ranks=[layer.value_rank for layer in attentions],
+            # Widths and sizes of the cache tensors vLLM allocated, not of the configuration that requested them.
+            cache_value_widths=[int(cache.shape[-1]) - layer.head_dim for cache, layer in zip(caches, attentions)],
+            kv_cache_shapes=[list(cache.shape) for cache in caches],
+            kv_cache_bytes=sum(cache.numel() * cache.element_size() for cache in caches),
+            collective_local_widths=[layer.num_heads * layer.value_rank for layer in attentions],
+            attention_backends=sorted({layer.attn.attn_backend.get_name() for layer in attentions}),
+            attention_impls=sorted({type(layer.attn.impl).__name__ for layer in attentions}),
             decode_output_layout='feature_major_allgather_slot' if self.c1_boundary is not None else 'token_major',
-            key_head_size=attention.head_dim, value_head_size=attention.value_rank)
+            key_head_size=attentions[0].head_dim, local_query_heads=attentions[0].num_heads, local_kv_heads=attentions[0].num_kv_heads)
 
 
 class BasisKVLlamaForCausalLM(CompactValueModel, LlamaForCausalLM):
@@ -229,23 +235,23 @@ class PreparedC1Output:
     its non-aliasing output contract for compilation.
     """
 
-    def __init__(self, group, device, local_width: int, max_tokens: int):
+    def __init__(self, group, device, max_local_width: int, max_tokens: int):
         self.communicator = AllGather.from_distributed(group, device=device)
-        self.local_width = local_width
-        self.communicator.configure_workspace(tokens=max_tokens, max_total_width=local_width * self.communicator.world_size, dtype=torch.bfloat16)
+        # The workspace is sized for the widest layer; every plan gathers exactly its layer's width.
+        self.communicator.configure_workspace(tokens=max_tokens, max_total_width=max_local_width * self.communicator.world_size, dtype=torch.bfloat16)
         self.prepared = {}
         self.capture_calls = 0
         self.eager_calls = 0
         self.direct_decode_calls = 0
 
-    def _prepared(self, tokens: int, dtype: torch.dtype, device: torch.device):
+    def _prepared(self, local_width: int, tokens: int, dtype: torch.dtype, device: torch.device):
         stream = torch.cuda.current_stream(device)
-        key = (tokens, stream.cuda_stream)
+        key = (local_width, tokens, stream.cuda_stream)
         capturing = torch.cuda.is_current_stream_capturing()
         prepared = self.prepared.get(key)
         if prepared is None:
-            assert not capturing, 'Warm this token count on the capture stream first'
-            prepared = self.communicator.prepare(self.local_width, tokens=tokens, dtype=dtype)
+            assert not capturing, 'Warm this width and token count on the capture stream first'
+            prepared = self.communicator.prepare(local_width, tokens=tokens, dtype=dtype)
             self.prepared[key] = prepared
         if capturing:
             self.capture_calls += 1
@@ -259,14 +265,14 @@ class PreparedC1Output:
         return torch.mm(arena.T, decoder)
 
     def __call__(self, local: Tensor, decoder: Tensor) -> Tensor:
-        prepared = self._prepared(int(local.shape[0]), local.dtype, local.device)
+        prepared = self._prepared(int(local.shape[1]), int(local.shape[0]), local.dtype, local.device)
         prepared.local.copy_(local.T)
         return self._gather_decode(prepared, decoder)
 
     def attention(self, attn_layer, query: Tensor, key: Tensor, value: Tensor, kv_cache: Tensor, attn_metadata, decoder: Tensor) -> Tensor:
         tokens = int(query.shape[0])
         if attn_metadata is not None and attn_metadata.max_query_len <= 1:
-            prepared = self._prepared(tokens, query.dtype, query.device)
+            prepared = self._prepared(attn_layer.impl.num_heads * attn_layer.head_size_v, tokens, query.dtype, query.device)
             local = prepared.local
             output = local.T.view(tokens, attn_layer.impl.num_heads, attn_layer.head_size_v)
             attn_layer.impl.forward(attn_layer, query, key, value, kv_cache, attn_metadata, output)
@@ -277,7 +283,7 @@ class PreparedC1Output:
         return self(output.flatten(1), decoder)
 
     def statistics(self):
-        return dict(backend='uniform_nccl', decoder_gemms=1, capture_calls=self.capture_calls, eager_calls=self.eager_calls, direct_decode_calls=self.direct_decode_calls, prepared_shapes=sorted({int(key[0]) for key in self.prepared}))
+        return dict(backend='uniform_nccl', decoder_gemms=1, capture_calls=self.capture_calls, eager_calls=self.eager_calls, direct_decode_calls=self.direct_decode_calls, prepared_shapes=sorted({(int(key[0]), int(key[1])) for key in self.prepared}))
 
 def c1_attention_output(query: Tensor, key: Tensor, value: Tensor, decoder: Tensor, layer_name: str) -> Tensor:
     (attn_metadata, attn_layer, kv_cache, slot_mapping) = get_attention_context(layer_name)
