@@ -49,6 +49,10 @@ def load_kvquant(root):
 
 def quantization_points(model):
     """{name: (module, groups, width)} for the K and V outputs that feed every layer's cache."""
+    from inference.attention import ValueAttention
+    from inference.model import install_value_factors
+    if not all(isinstance(module, ValueAttention) for module in attention_layers(model).values()):
+        install_value_factors(model, None)
     points = {}
     for layer, attention in attention_layers(model).items():
         points[f"{layer}.k"] = (attention.k_norm, attention.groups, attention.head_dim)
@@ -100,6 +104,10 @@ def install_hooks(model, fmt, *, quantizers=None, upstream=None, page_size=4):
     for name, (module, groups, width) in quantization_points(model).items():
         if fmt == "nuq4":
             hook = lambda m, x, y, name=name, g=groups, w=width: nuq4_roundtrip(upstream, quantizers[name], name, y, g, w)
+        elif name.endswith('.k'):
+            layer = int(name.split('.')[0])
+            module = attention_layers(model)[layer].key_cache_transform
+            hook = lambda m, x, y: e4m3_roundtrip(y, (-1,))
         else:
             hook = lambda m, x, y, name=name, g=groups, w=width: fp8_roundtrip(name, y, g, w, page_size)
         handles.append(module.register_forward_hook(hook))
@@ -187,7 +195,7 @@ def evaluate(args, rest):
         write_json(output / "quantization.json", dict(
             format=args.format, page_size=args.page_size if args.format == "fp8" else None,
             quantizers=str(args.quantizers) if args.quantizers else None,
-            keys="k_norm output, pre-RoPE", values="v_proj output, Value latent"))
+            keys="cache input, post-RoPE" if args.format == "fp8" else "k_norm output, pre-RoPE", values="v_proj output, Value latent"))
 
 
 def main(argv=None):

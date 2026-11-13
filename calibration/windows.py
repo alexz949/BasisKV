@@ -1,17 +1,13 @@
 """Sample C4 windows: one excerpt per distinct document, packed into fixed-length windows.
 
-    python -m calibration.windows --model MODEL --output WINDOWS --sequence-length 2048 --fit-windows 32 --heldout-windows 16
+    python -m calibration.windows --model MODEL --output WINDOWS --sequence-length 2048 --fit-windows 256 --heldout-windows 64
     python -m calibration.windows --model MODEL --output C4_VALIDATION --split validation --fit-windows 128 --heldout-windows 0
 
 Fit and held-out windows come from disjoint documents. The manifest lists both id ranges
 and the sampled documents; rerunning with the same settings is a no-op. Profile windows
-for rank allocation use another --seed so they share no documents with the fit windows.
+for rank allocation use another --seed for a separate profiling sample.
 The second form builds the 128 fixed C4 validation windows that eval.ppl reports on.
 
-With datasets 4.4.2 the builder reproduces the paper's banks byte for byte. Qwen3-8B-Base Table 1 used seed
-20260821 (256 fit + 64 held-out, 2048 tokens) for calibration, seed 20260828 with --sequence-length 4096
---fit-windows 512 --heldout-windows 128 for the KL-probe windows (rows 320..447, first 2048 tokens), and
---split validation --seed 20260828 for the C4 perplexity windows. Other datasets versions order the stream differently.
 """
 
 import argparse
@@ -23,7 +19,7 @@ from pathlib import Path
 import torch
 
 from calibration.common import setup
-from core.router_io import read_json, save_tensors, write_json
+from core.router_io import read_json, save_tensors, sha256, write_json
 
 log = logging.getLogger("basiskv.windows")
 DATASET, DATASET_CONFIG, TEXT_FIELD = "allenai/c4", "en", "text"
@@ -38,8 +34,8 @@ def main(argv=None):
     parser.add_argument("--model", type=Path, required=True, help="tokenizer source")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sequence-length", type=int, default=2048)
-    parser.add_argument("--fit-windows", type=int, default=32)
-    parser.add_argument("--heldout-windows", type=int, default=16)
+    parser.add_argument("--fit-windows", type=int, default=256)
+    parser.add_argument("--heldout-windows", type=int, default=64)
     parser.add_argument("--seed", type=int, default=20260821, help="stream shuffle and excerpt offsets; 20260821 is the paper's Table 1 calibration bank")
     parser.add_argument("--split", choices=("train", "validation"), default="train", help="train for calibration, validation for eval.ppl")
     args = parser.parse_args(argv)
@@ -52,9 +48,14 @@ def main(argv=None):
     config = dict(model=str(model), dataset=DATASET, dataset_config=DATASET_CONFIG, dataset_revision=REVISION, dataset_split=args.split,
                   seed=args.seed, sequence_length=length, piece_length=piece_length, fit_windows=args.fit_windows,
                   heldout_windows=args.heldout_windows)
+    identity = dict(model_config_sha256=sha256(model / 'config.json'),
+                    tokenizer_sha256=sha256(model / 'tokenizer.json'))
     path, manifest_path = output / "windows.safetensors", output / "manifest.json"
     if manifest_path.exists():
-        assert read_json(manifest_path)["config"] == config, "window inputs changed"
+        existing = read_json(manifest_path)
+        assert existing["config"] == config, "window inputs changed"
+        assert all(existing[key] == value for key, value in identity.items())
+        assert existing['sha256'] == sha256(path)
         log.info("windows already complete: %s", path)
         return
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True)
@@ -82,6 +83,7 @@ def main(argv=None):
     save_tensors(path, {"input_ids": torch.stack(pieces).reshape(total, length)})
     write_json(manifest_path, dict(
         status="complete", config=config, shape=[total, length], model=str(model),
+        sha256=sha256(path), **identity,
         fit_ids=list(range(args.fit_windows)), validation_ids=list(range(args.fit_windows, total)),
         packing="one excerpt per distinct document; no separators or special tokens", records=records))
 

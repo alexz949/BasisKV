@@ -108,8 +108,8 @@ def main():
         assert single_kv_head_layout(fit["geometry"], args.tp_size), (
             "this benchmark admits prompts in chunks, which the compact path serves with one KV head and 4 or 8 query heads "
             "per rank (TP 8 for Llama-3.1-8B and Qwen3-8B)")
-        overrides = {"architectures": [COMPACT_ARCHITECTURES[model_type]], "basisserve_c1_factor_dir": str(root),
-                     "basisserve_c1_validation": args.factor_validation}
+        overrides = {"architectures": [COMPACT_ARCHITECTURES[model_type]], "basiskv_c1_factor_dir": str(root),
+                     "basiskv_c1_validation": args.factor_validation}
     import torch
     import transformers
     import triton
@@ -173,7 +173,7 @@ def main():
                                   preemptions=measured["preemptions"],
                                   output_tokens_per_second=measured["output_tokens_per_second"],
                                   ttft_ms=measured["ttft_ms"], tpot_ms=measured["tpot_ms"])), flush=True)
-        row["workers"] = llm.collective_rpc("basisserve_c1_statistics" if args.arm == "basis" else "basisserve_cuda_statistics")
+        row["workers"] = llm.collective_rpc("basiskv_c1_statistics" if args.arm == "basis" else "basiskv_cuda_statistics")
         if args.arm == "basis":
             # Layer by layer, every rank loaded the scheduled factors, holds a cache tensor whose Value width is that
             # layer's rank, and gathered exactly that layer's width; it also executed the compact attention during
@@ -190,9 +190,9 @@ def main():
         cohort = [{"prompt_token_ids": row} for row in source_prompts[:batch]]
         prefix = output_dir / "profiles" / f"{args.arm}_b{batch}"
         print(f"PROFILE arm={args.arm} batch={batch} prefix={prefix}", flush=True)
-        llm.collective_rpc("basisserve_profile_start")
+        llm.collective_rpc("basiskv_profile_start")
         run_batch(llm, cohort, sampling, args.decode_tokens)
-        llm.collective_rpc("basisserve_profile_stop", args=(str(prefix),))
+        llm.collective_rpc("basiskv_profile_stop", args=(str(prefix),))
         payload["profiles"].append(str(prefix))
         save()
     payload["status"] = "complete"

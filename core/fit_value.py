@@ -36,6 +36,8 @@ class FitSettings:
     factor_dtype: str
     allow_tf32: bool
     covariance_damping: float
+    initialization: str
+    seed: int
 
     @classmethod
     def from_args(cls, args):
@@ -103,9 +105,16 @@ def fit_layer(layer, *, snapshot_dir, manifest, output_dir, config, settings, ge
         del fit_raw, heldout_raw, fit_covariance
         mapping = geometry.head_to_kv_group(device)
         work_dtype = settings.torch_work_dtype
-        initial, initialization = initialize_weighted_svd(
-            fit_objective.covariance.to(work_dtype), target.to(work_dtype), mapping, settings.cache_rank
-        )
+        if settings.initialization == 'activation-aware':
+            initial, initialization = initialize_weighted_svd(
+                fit_objective.covariance.to(work_dtype), target.to(work_dtype), mapping, settings.cache_rank
+            )
+        else:
+            generator = torch.Generator(device='cpu').manual_seed(settings.seed + layer)
+            random = torch.randn(geometry.num_kv_heads, geometry.head_dim, settings.cache_rank,
+                                 generator=generator, dtype=work_dtype).to(device)
+            initial = torch.linalg.qr(random, mode='reduced')[0]
+            initialization = [{'method': 'random-orthogonal', 'seed': settings.seed + layer}]
         encoder, decoder, info = fit_joint(
             fit_objective, initial, mapping,
             sweeps=settings.encoder_sweeps, cg_iterations=settings.cg_iterations, work_dtype=work_dtype,
@@ -204,6 +213,8 @@ def parse_args(argv=None):
     fit.add_argument("--output-dir", required=True)
     fit.add_argument("--layers", default="all", help="'all', or indices and ranges such as 0-3,7")
     fit.add_argument("--rank", dest="cache_rank", type=int, required=True, help="retained V dimensions per KV head")
+    fit.add_argument("--initialization", choices=("activation-aware", "random-orthogonal"), default="activation-aware")
+    fit.add_argument("--seed", type=int, default=42)
     fit.add_argument("--encoder-sweeps", type=int, default=6, help="encoder/decoder ALS sweeps")
     fit.add_argument("--cg-iterations", type=int, default=16, help="fixed CG iterations per encoder update")
     fit.add_argument("--covariance-damping", type=float, default=1e-7, help="relative trace damping of the fit covariance")

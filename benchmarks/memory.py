@@ -5,6 +5,7 @@ import os
 from datetime import timedelta
 
 from benchmarks.common import add_model_arguments, arguments, distribution, load_model, metadata, prompts, save
+from kernels.routing_config import PAGE_SIZE, PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def summarize(ranks, batch, steps):
@@ -23,7 +24,7 @@ def main():
     parser.add_argument('--batch-size', type=int, required=True)
     parser.add_argument('--numa-node', type=int, help='Optional explicit host allocation NUMA binding; no assumed machine topology')
     args = parser.parse_args()
-    assert args.context > 2048 and not args.output.exists(), 'the context must exceed the routed budget, and the output must be new'
+    assert args.context > SUPPORT and not args.output.exists(), 'the context must exceed the support budget, and the output must be new'
     assert (args.router_dir is not None) == (args.arm == 'basis') and (args.arm != 'dense' or args.value_factors is None), 'basis takes --router-dir; dense takes neither factors nor router'
     import torch
     import torch.distributed as dist
@@ -40,13 +41,14 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     if world > 1:
         dist.init_process_group('nccl', timeout=timedelta(minutes=20))
-    model = load_model(args.model, world)
+    model = load_model(args.model, world, args.config)
     capacity = args.context + args.warmup_steps + args.decode_steps
     layers, communicator = install(model, args, batch=args.batch_size, capacity=capacity,
         rank=rank, world=world, host_keys=args.arm == 'basis')
     prompt = prompts(args.tokens, args.batch_size, args.context)
     result = dict(schema='basiskv.benchmark.memory.v1', status='running', arguments=arguments(args), environment=metadata(), trials=[],
-        protocol=dict(tp=world, page_size=32, routed_tokens=1984, recent_tokens=64,
+        protocol=dict(tp=world, page_size=PAGE_SIZE, pinned_pages=PINNED_PAGES,
+            routed_tokens=ROUTED_TOKENS, recent_tokens=RECENT_TOKENS, support_tokens=SUPPORT,
             key_placement='pinned_host_with_gpu_slots' if args.arm == 'basis' else 'gpu',
             memory='Peak PyTorch allocated bytes during steady decode, maximum across ranks; excludes prefill peaks. Compact Value factors store Base inside V; residual codes and selected-Key slots are included.',
             throughput='batch * measured steps / maximum rank wall time; prefill and conditioning excluded.'))

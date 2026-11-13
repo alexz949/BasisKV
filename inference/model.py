@@ -80,6 +80,7 @@ def install_router(model, directory, *, page_size=4, routed_tokens=2048, pinned_
         install_value_factors(model, None)
     for index, attention in attention_layers(model).items():
         payload, protocol = router_factors(directory, index)
+        assert protocol['page_size'] == page_size and protocol['excluded_prefix_pages'] == pinned_pages, 'router calibration and evaluation page settings differ'
         base, residual = protocol['base_rank'], protocol['residual_rank']
         device = next(attention.parameters()).device
         attention.router = {name: payload[f'{name}_b{base}'].to(device=device, dtype=torch.float32)

@@ -64,12 +64,12 @@ class PagedImpl(FlashAttentionDiffKVImpl):
         seq_lens = attn_metadata.seq_lens
         num_sequences = int(query_start_loc.shape[0]) - 1
         cache_key = (query_start_loc.data_ptr(), query_start_loc._version, seq_lens.data_ptr(), seq_lens._version, int(attn_metadata.num_actual_tokens), num_sequences)
-        cached = getattr(attn_metadata, '_basisserve_host_sequence_layout', None)
+        cached = getattr(attn_metadata, '_basiskv_host_sequence_layout', None)
         if cached is None or cached[0] != cache_key:
             starts = tuple(map(int, query_start_loc[:num_sequences + 1].cpu().tolist()))
             lengths = tuple(map(int, seq_lens[:num_sequences].cpu().tolist()))
             cached = (cache_key, starts, lengths)
-            setattr(attn_metadata, '_basisserve_host_sequence_layout', cached)
+            setattr(attn_metadata, '_basiskv_host_sequence_layout', cached)
         return (cached[1], cached[2])
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None, output_scale=None, output_block_scale=None):
@@ -93,7 +93,7 @@ class PagedImpl(FlashAttentionDiffKVImpl):
             if query_length == 1:
                 self._run_decode(layer=layer, query=query_slice, kv_cache=kv_cache, block_table=attn_metadata.block_table[sequence_index:sequence_index + 1], seq_lens=attn_metadata.seq_lens[sequence_index:sequence_index + 1], output=output_slice)
                 continue
-            assert query_length == sequence_length, 'BasisServe compact-V does not yet support chunked prefill'
+            assert query_length == sequence_length, 'BasisKV compact-V does not yet support chunked prefill'
             compact_output = compressed_v_prefill_attention(query_slice.transpose(0, 1).unsqueeze(0), key[query_start:query_stop].transpose(0, 1).unsqueeze(0), value[query_start:query_stop].transpose(0, 1).unsqueeze(0), scale=self.scale)
             output_slice.copy_(compact_output.squeeze(0).transpose(0, 1))
         return output

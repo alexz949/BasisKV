@@ -20,10 +20,11 @@ import argparse
 import logging
 import math
 import sys
+import torch
 from pathlib import Path
 
 from core.factor_io import assemble, read_results
-from core.router_io import read_json
+from core.router_io import read_json, write_json
 
 log = logging.getLogger("basiskv.allocate")
 PROBES_FORMAT = "basiskv.rank_probes.v1"
@@ -40,8 +41,13 @@ def parse_banks(items):
 
 def error_curves(banks):
     """Held-out relative reconstruction error of every layer at every bank rank."""
+    if (next(iter(banks.values())) / 'value.pt').is_file():
+        layers = torch.load(next(iter(banks.values())) / 'value.pt', weights_only=True, map_location='cpu')['layers']
+        return {layer: {rank: read_json(directory / f'layer_{layer:03d}.json')['heldout_relative_mse']
+                        for rank, directory in banks.items()} for layer in layers}
     results = {rank: read_results(directory) for rank, directory in banks.items()}
     layers = next(iter(results.values()))["layers"]
+    assert all(result["layers"] == layers for result in results.values()), "candidate banks cover different layers"
     curves = {
         layer: {rank: float(results[rank]["records"][index]["heldout"]["factor_dtype_relative_mse"]) for rank in banks}
         for index, layer in enumerate(layers)
@@ -138,7 +144,14 @@ def main(argv=None):
         "predicted_costs": {str(layer): {str(rank): cost for rank, cost in costs[layer].items()} for layer in curves},
         "predicted_kl_change": predicted,
     }
-    assemble(args.output.expanduser().resolve(), banks, layer_ranks, allocation)
+    if (next(iter(banks.values())) / 'value.pt').is_file():
+        args.output.mkdir(parents=True, exist_ok=True)
+        payloads = {rank: torch.load(directory / 'value.pt', weights_only=True, map_location='cpu') for rank, directory in banks.items()}
+        payload = dict(format='basiskv.qwen35.gated_v_als.v1', layers={layer: payloads[rank]['layers'][layer] for layer, rank in schedule.items()})
+        torch.save(payload, args.output / 'value.pt')
+        write_json(args.output / 'allocation.json', dict(layer_ranks=schedule, **allocation))
+    else:
+        assemble(args.output.expanduser().resolve(), banks, layer_ranks, allocation)
     log.info("assembled %d layers into %s", len(layer_ranks), args.output)
 
 

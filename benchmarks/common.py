@@ -16,10 +16,13 @@ def command(args):
 
 
 def metadata():
-    files = command(['git','ls-files','--cached','--others','--exclude-standard'])['stdout'].splitlines()
-    suffixes = {'.py','.cu','.cpp','.h','.sh'}
-    hashes = {p:hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in sorted(set(files))
-              if Path(p).is_file() and Path(p).suffix in suffixes}
+    root = Path(__file__).resolve().parents[1]
+    suffixes = {'.py', '.cu', '.cpp', '.h', '.cuh', '.sh', '.json', '.toml', '.txt'}
+    hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in sorted(root.rglob('*')) if p.is_file() and p.suffix in suffixes
+              and p.relative_to(root).parts[0] in
+              {'core', 'calibration', 'inference', 'kernels', 'benchmarks', 'eval', 'appendix',
+               'pyproject.toml', 'requirements.txt', 'requirements-tp.txt', 'requirements-qwen35.txt'}}
     snapshot=command(['nvidia-smi','--query-compute-apps=gpu_uuid,pid,used_gpu_memory','--format=csv,noheader,nounits'])
     tree=command(['ps','-eo','pid=,ppid='])['stdout'].splitlines()
     parents={int(v[0]):int(v[1]) for line in tree if len(v:=line.split())==2}
@@ -29,9 +32,7 @@ def metadata():
         if children<=own:break
         own.update(children)
     external=[line for line in snapshot['stdout'].splitlines() if line.strip() and int(line.split(',')[1]) not in own]
-    return dict(git_commit=command(['git','rev-parse','HEAD'])['stdout'].strip(),
-                git_status=command(['git','status','--porcelain'])['stdout'],
-                source_sha256=hashes, hostname=socket.gethostname(), command_line=sys.argv,
+    return dict(source_sha256=hashes, hostname=socket.gethostname(), command_line=sys.argv,
                 pytorch=torch.__version__, cuda=torch.version.cuda,
                 nccl=torch.cuda.nccl.version() if torch.cuda.is_available() else None,
                 conda_environment=os.environ.get('CONDA_DEFAULT_ENV',sys.prefix),pid=os.getpid(),gpu_process_snapshot=snapshot,external_gpu_processes=external,
@@ -61,6 +62,7 @@ def arguments(args):
 
 def add_model_arguments(parser):
     parser.add_argument('--model', type=Path, required=True)
+    parser.add_argument('--config', type=Path, help='extended-context Hugging Face configuration')
     parser.add_argument('--arm', choices=('dense', 'basis'), required=True)
     parser.add_argument('--value-factors', type=Path)
     parser.add_argument('--router-dir', type=Path)
@@ -78,9 +80,11 @@ def prompts(path, batch, length, row=0):
     return values[row:row + batch, :length].long().contiguous()
 
 
-def load_model(path, world=1):
-    from transformers import AutoModelForCausalLM
+def load_model(path, world=1, config_path=None):
+    from transformers import AutoConfig, AutoModelForCausalLM
     options = {}
+    if config_path is not None:
+        options['config'] = AutoConfig.from_pretrained(config_path, local_files_only=True)
     if world > 1:
         from transformers.distributed import DistributedConfig
         options['distributed_config'] = DistributedConfig(tp_size=world)

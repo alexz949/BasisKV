@@ -38,6 +38,7 @@ class ValueAttention(nn.Module):
             self.v_proj.bias.data.copy_((e.mT @ native.v_proj.bias.float().reshape(self.groups, self.head_dim, 1)).flatten())
         if self.o_proj.bias is not None:
             self.o_proj.bias.data.copy_(native.o_proj.bias)
+        self.key_cache_transform = nn.Identity()
         self.router = None
 
     def forward(self, hidden_states, position_embeddings=None, attention_mask=None, past_key_values=None, **kwargs):
@@ -54,6 +55,7 @@ class ValueAttention(nn.Module):
         v = self.v_proj(hidden_states).view(batch, length, self.groups, self.rank).transpose(1, 2)
         if self.router is not None:
             sidecar = append_sidecar(past_key_values, self.layer_idx, v, k, position_embeddings, self.router)
+        k = self.key_cache_transform(k)
         if past_key_values is not None:
             (k, v) = past_key_values.update(k, v, self.layer_idx)
         if self.router is not None and length == 1:

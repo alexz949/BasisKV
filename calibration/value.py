@@ -4,7 +4,7 @@
 
 Every attention layer gets the FP64 Gram of its o_proj input over the fit windows and over
 the held-out windows, normalized by row count, plus the dense o_proj weight, in the
-`basisserve.attention_o_proj_covariances.v1` layout. For large models split the windows with
+`basiskv.attention_o_proj_covariances.v1` layout. For large models split the windows with
 --window-shard-index / --window-shard-count and rerun with --merge afterwards.
 """
 

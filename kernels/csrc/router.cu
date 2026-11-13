@@ -1,4 +1,4 @@
-// Page32 B16R16 GQA4 conditional router for the system benchmarks.
+// Page4 B16R16 GQA4 conditional router for the system benchmarks.
 //
 // Four entry points cover one decode step: append_decode writes a token's Value latent,
 // Base coordinates, and residual code (and the exact Key into mapped host memory when the
@@ -13,7 +13,7 @@
 #include "warp.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -43,16 +43,32 @@ constexpr int kValueRank = BASIS_VALUE_DIM;
 constexpr int kBaseRank = BASIS_BASE_RANK;
 constexpr int kResidualRank = BASIS_RESIDUAL_RANK;
 constexpr int kPageSize = BASIS_PAGE_SIZE;
-constexpr int kScanWarps = 8;  // page_lse_kernel: 16 tokens per warp, so four pages per block
+constexpr int kScanWarps = 8;  // 16 scored tokens per warp, 32 Page4 pages per block
 constexpr int kTokensPerBlock = kScanWarps * 16;
 constexpr int kPagesPerBlock = kTokensPerBlock / kPageSize;
-constexpr int kMaxPages = 8192;
-constexpr int kMaxSelectedPages = 128;
-constexpr int kMaxSupport = 2048;  // slot planning: routed tokens plus the recent tail
-static_assert(kPageSize == 32 && kQueriesPerKv == 4,
-              "the page scan is written for Page32 with four query heads per KV head");
+constexpr int kMaxSupport = BASIS_ROUTED_TOKENS + BASIS_RECENT_TOKENS;
+static_assert(kPageSize == 4 && kQueriesPerKv == 4,
+              "the page scan is written for Page4 with four query heads per KV head");
 static_assert(kBaseRank == 8 || kBaseRank == 16, "the Base reconstruction MMA covers ranks 8 and 16");
 static_assert(kResidualRank > 0 && kResidualRank <= kQueryKeyDim, "residual rank");
+
+#include "page_select.cuh"
+
+__device__ __forceinline__ float page_sum(float value) {
+#pragma unroll
+  for (int offset = kPageSize / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset, kPageSize);
+  }
+  return value;
+}
+
+__device__ __forceinline__ float page_max(float value) {
+#pragma unroll
+  for (int offset = kPageSize / 2; offset > 0; offset /= 2) {
+    value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset, kPageSize));
+  }
+  return value;
+}
 
 __device__ __forceinline__ float round_bfloat16(float value) {
   return __bfloat162float(__float2bfloat16_rn(value));
@@ -239,11 +255,11 @@ __global__ void page_lse_kernel(
   }
   __syncthreads();
 
-  for (int item = warp; item < kPagesPerBlock * kQueriesPerKv; item += kScanWarps) {
-    const int page_in_block = item / kQueriesPerKv;
+  for (int item = warp; item < kTokensPerBlock / kWarpSize * kQueriesPerKv; item += kScanWarps) {
+    const int segment = item / kQueriesPerKv;
     const int query_head = item % kQueriesPerKv;
-    const int64_t page = page_group * kPagesPerBlock + page_in_block;
-    const int64_t token = token_start + page_in_block * kPageSize + lane;
+    const int64_t page = page_group * kPagesPerBlock + (segment * kWarpSize + lane) / kPageSize;
+    const int64_t token = token_start + segment * kWarpSize + lane;
     float score = -CUDART_INF_F;
     if (token < tokens) {
       float residual_score = 0.0f;
@@ -259,13 +275,13 @@ __global__ void page_lse_kernel(
       score = round_bfloat16(
           round_bfloat16(
               round_bfloat16(
-                  shared_scores[query_head * kTokensPerBlock + page_in_block * kPageSize + lane]) +
+                  shared_scores[query_head * kTokensPerBlock + segment * kWarpSize + lane]) +
               round_bfloat16(residual_score)) *
           scale);
     }
-    const float maximum = warp_max(score);
-    const float sum = warp_sum(__expf(score - maximum));
-    if (lane == 0 && page < pages) {
+    const float maximum = page_max(score);
+    const float sum = page_sum(__expf(score - maximum));
+    if (lane % kPageSize == 0 && page < pages) {
       output[batch * output_stride_batch + kv_head * output_stride_head +
              query_head * output_stride_query + page] =
           maximum == -CUDART_INF_F ? -CUDART_INF_F : maximum + __logf(sum);
@@ -387,138 +403,18 @@ __global__ void append_decode_kernel(
   }
 }
 
-// One block per (batch, KV head). Each query head's page log-mass becomes a probability
-// over the free pages; the group score of a page is the maximum over heads. The pinned
-// prefix pages come first, then the top pages by group score, sorted by page ID. The
-// support list holds the routed tokens below `historical`, then the recent tail up to `end`.
-// With kPlanSlots the block also maps every support token onto a slot of the per-row Key
-// slot cache: hits keep their slot, misses take free slots and are listed for fetch.
-template <int kItemsPerThread, bool kPlanSlots>
-__global__ void select_pages_kernel(
-    const float* __restrict__ page_log_mass, int64_t* __restrict__ pages_output,
-    int64_t* __restrict__ support_ids, int64_t* __restrict__ resident, int* __restrict__ lookup,
-    int64_t* __restrict__ slots, int* __restrict__ missing, int* __restrict__ counts,
-    int64_t kv_heads, int pages, int selected_count, int prefix_count, int capacity,
-    int64_t historical, int64_t end, int64_t input_stride_batch, int64_t input_stride_head,
-    int64_t input_stride_query) {
-  using BlockReduce = cub::BlockReduce<float, kThreads>;
-  using BlockSort = cub::BlockRadixSort<float, kThreads, kItemsPerThread, int>;
-  union TemporaryStorage {
-    typename BlockReduce::TempStorage reduce;
-    typename BlockSort::TempStorage sort;
-  };
-  __shared__ TemporaryStorage temporary;
-  __shared__ float head_maximum[kQueriesPerKv];
-  __shared__ float head_inverse_sum[kQueriesPerKv];
-  __shared__ int selected_pages[kMaxSelectedPages];
-  __shared__ uint8_t used[kPlanSlots ? kMaxSupport : 1];
-  __shared__ int free_slots[kPlanSlots ? kMaxSupport : 1];
-  __shared__ int requested[kPlanSlots ? kMaxSupport : 1];
+// Map selected tokens to persistent Key slots after Page4 selection.
+__global__ void plan_slots_kernel(
+    const int64_t* __restrict__ support_ids, int64_t* __restrict__ resident,
+    int* __restrict__ lookup, int64_t* __restrict__ slots,
+    int* __restrict__ missing, int* __restrict__ counts, int capacity, int support_count) {
+  __shared__ uint8_t used[kMaxSupport];
+  __shared__ int free_slots[kMaxSupport];
+  __shared__ int requested[kMaxSupport];
   __shared__ int free_count, miss_count, hit_count, valid_count;
-
   const int thread = static_cast<int>(threadIdx.x);
   const int64_t row = static_cast<int64_t>(blockIdx.x);
-  const int64_t batch = row / kv_heads;
-  const int64_t kv_head = row % kv_heads;
-  const int64_t input_base = batch * input_stride_batch + kv_head * input_stride_head;
-  const int recent = static_cast<int>(end - historical);
-  const int support_count = selected_count * kPageSize + recent;
-
-  if (thread < prefix_count) {
-    selected_pages[thread] = thread;
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int head = 0; head < kQueriesPerKv; ++head) {
-    float local_maximum = -CUDART_INF_F;
-    for (int page = prefix_count + thread; page < pages; page += kThreads) {
-      local_maximum =
-          fmaxf(local_maximum, page_log_mass[input_base + head * input_stride_query + page]);
-    }
-    const float maximum = BlockReduce(temporary.reduce).Reduce(local_maximum, cub::Max());
-    if (thread == 0) {
-      head_maximum[head] = maximum;
-    }
-    __syncthreads();
-    float local_sum = 0.0f;
-    for (int page = prefix_count + thread; page < pages; page += kThreads) {
-      local_sum +=
-          __expf(page_log_mass[input_base + head * input_stride_query + page] - head_maximum[head]);
-    }
-    const float sum = BlockReduce(temporary.reduce).Sum(local_sum);
-    if (thread == 0) {
-      head_inverse_sum[head] = 1.0f / sum;
-    }
-    __syncthreads();
-  }
-
-  float scores[kItemsPerThread];
-  int page_ids[kItemsPerThread];
-#pragma unroll
-  for (int item = 0; item < kItemsPerThread; ++item) {
-    const int page = thread * kItemsPerThread + item;
-    page_ids[item] = page;
-    float group_score = -CUDART_INF_F;
-    if (page >= prefix_count && page < pages) {
-      group_score = 0.0f;
-#pragma unroll
-      for (int head = 0; head < kQueriesPerKv; ++head) {
-        const float probability =
-            __expf(page_log_mass[input_base + head * input_stride_query + page] -
-                   head_maximum[head]) *
-            head_inverse_sum[head];
-        group_score = fmaxf(group_score, probability);
-      }
-    }
-    scores[item] = group_score;
-  }
-  BlockSort(temporary.sort).SortDescending(scores, page_ids);
-  const int remaining = selected_count - prefix_count;
-#pragma unroll
-  for (int item = 0; item < kItemsPerThread; ++item) {
-    const int rank = thread * kItemsPerThread + item;
-    if (rank < remaining) {
-      selected_pages[prefix_count + rank] = page_ids[item];
-    }
-  }
-  __syncthreads();
-
-  // Bitonic sort of the selected pages by ID so the support list is ascending.
-  if (thread < kMaxSelectedPages && thread >= selected_count) {
-    selected_pages[thread] = INT_MAX;
-  }
-  __syncthreads();
-  for (int width = 2; width <= kMaxSelectedPages; width *= 2) {
-    for (int stride = width / 2; stride > 0; stride /= 2) {
-      if (thread < kMaxSelectedPages) {
-        const int partner = thread ^ stride;
-        if (partner > thread) {
-          const int left = selected_pages[thread];
-          const int right = selected_pages[partner];
-          const bool ascending = (thread & width) == 0;
-          if ((ascending && left > right) || (!ascending && left < right)) {
-            selected_pages[thread] = right;
-            selected_pages[partner] = left;
-          }
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  if (thread < selected_count) {
-    pages_output[row * selected_count + thread] = selected_pages[thread];
-  }
-  for (int index = thread; index < selected_count * kPageSize; index += kThreads) {
-    const int64_t token = selected_pages[index / kPageSize] * kPageSize + index % kPageSize;
-    support_ids[row * support_count + index] = token < historical ? token : -1;
-  }
-  for (int index = thread; index < recent; index += kThreads) {
-    const int64_t token = historical + index;
-    support_ids[row * support_count + selected_count * kPageSize + index] = token < end ? token : -1;
-  }
-  if constexpr (kPlanSlots) {
+  {
     if (thread == 0) {
       free_count = miss_count = hit_count = valid_count = 0;
     }
@@ -656,7 +552,7 @@ at::Tensor append_host_key(const at::Tensor& host_key, const at::Tensor& key, in
 // query [B, H, 1, 128]; base_code [B, G, T, BASE_RANK]; residual_code [B, G, T, RESIDUAL_RANK];
 // base_right [G, BASE_RANK, 128]; base_bias [G, 128]; residual_query [H, 128, RESIDUAL_RANK];
 // rope_cos / rope_sin [T, 64]; query_code [B, G, 4, RESIDUAL_RANK] scratch;
-// output [B, G, 4, ceil(T / 32)] FP32 page log-sum-exp.
+// output [B, G, 4, ceil(T / 4)] FP32 page log-sum-exp.
 at::Tensor page_lse(const at::Tensor& query, const at::Tensor& base_code,
                     const at::Tensor& residual_code, const at::Tensor& base_right,
                     const at::Tensor& base_bias, const at::Tensor& residual_query,
@@ -754,58 +650,38 @@ void append_decode(const at::Tensor& key, const at::Tensor& value, const at::Ten
   assert(cudaGetLastError() == cudaSuccess);
 }
 
-template <bool kPlanSlots>
-void launch_select(const at::Tensor& page_log_mass, const at::Tensor& pages_output,
-                   const at::Tensor& support_ids, int64_t* resident, int* lookup, int64_t* slots,
-                   int* missing, int* counts, int capacity, int64_t historical, int64_t end,
-                   int64_t pinned_prefix_pages) {
+// Scores [B,G,4,pages] are consumed: the selector reuses head 0 for candidate keys.
+// support_ids [B,G,2048+64] pads tokens beyond an incomplete last page with -1.
+void select_pages(const at::Tensor& page_log_mass, const at::Tensor& pages_output,
+                  const at::Tensor& support_ids, const at::Tensor& scratch,
+                  int64_t historical, int64_t end) {
   const int64_t batch = page_log_mass.size(0), kv_heads = page_log_mass.size(1);
-  const int64_t pages = page_log_mass.size(3), selected_count = pages_output.size(2);
-  const int64_t support_count = selected_count * kPageSize + (end - historical);
-  assert(page_log_mass.is_cuda() && pages_output.is_cuda() && support_ids.is_cuda());
-  assert(page_log_mass.scalar_type() == at::kFloat && pages_output.scalar_type() == at::kLong);
-  assert(support_ids.scalar_type() == at::kLong);
+  const int pages = static_cast<int>(page_log_mass.size(3));
+  const int64_t rows = batch * kv_heads;
+  assert(page_log_mass.is_cuda() && page_log_mass.scalar_type() == at::kFloat);
   assert(page_log_mass.dim() == 4 && page_log_mass.size(2) == kQueriesPerKv);
-  assert(page_log_mass.stride(3) == 1 && pages_output.is_contiguous() && support_ids.is_contiguous());
-  assert(historical >= 0 && end >= historical && pages == (historical + kPageSize - 1) / kPageSize);
-  assert(pages <= kMaxPages && pinned_prefix_pages >= 0 && pinned_prefix_pages <= selected_count);
-  assert(selected_count <= kMaxSelectedPages && selected_count < pages);
-  assert(pages_output.sizes() == at::IntArrayRef({batch, kv_heads, selected_count}));
-  assert(support_ids.sizes() == at::IntArrayRef({batch, kv_heads, support_count}));
-  if constexpr (kPlanSlots) {
-    assert(support_count <= kMaxSupport && pages <= kThreads * 16);
+  assert(page_log_mass.stride(3) == 1);
+  for (const at::Tensor* tensor : {&pages_output, &support_ids}) {
+    assert(tensor->is_cuda() && tensor->is_contiguous() && tensor->scalar_type() == at::kLong);
   }
-
+  assert(scratch.is_cuda() && scratch.is_contiguous() && scratch.scalar_type() == at::kFloat);
+  assert(scratch.numel() == rows * kScratchWords);
+  assert(historical > BASIS_ROUTED_TOKENS && end - historical == kRecentTokens);
+  assert(pages == (historical + kPageSize - 1) / kPageSize && pages <= kMaxGroups * kGroupPages);
+  assert(pages_output.sizes() == at::IntArrayRef({batch, kv_heads, kRoutedPages}));
+  assert(support_ids.sizes() == at::IntArrayRef({batch, kv_heads, kMaxSupport}));
+  const int blocks_per_row = (pages + kGroupThreads * kGroupPages - 1) / (kGroupThreads * kGroupPages);
   c10::cuda::CUDAGuard guard(page_log_mass.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream(page_log_mass.get_device()).stream();
-  const auto launch = [&](auto items) {
-    select_pages_kernel<decltype(items)::value, kPlanSlots>
-        <<<static_cast<unsigned int>(batch * kv_heads), kThreads, 0, stream>>>(
-            page_log_mass.const_data_ptr<float>(), pages_output.mutable_data_ptr<int64_t>(),
-            support_ids.mutable_data_ptr<int64_t>(), resident, lookup, slots, missing, counts,
-            kv_heads, static_cast<int>(pages), static_cast<int>(selected_count),
-            static_cast<int>(pinned_prefix_pages), capacity, historical, end,
-            page_log_mass.stride(0), page_log_mass.stride(1), page_log_mass.stride(2));
-  };
-  if (pages <= kThreads * 8) {
-    launch(std::integral_constant<int, 8>{});
-  } else if (pages <= kThreads * 16) {
-    launch(std::integral_constant<int, 16>{});
-  } else {
-    if constexpr (!kPlanSlots) {
-      launch(std::integral_constant<int, 32>{});
-    }
-  }
+  page_group_statistics_kernel<<<static_cast<unsigned int>(rows * blocks_per_row), kGroupThreads, 0, stream>>>(
+      page_log_mass.const_data_ptr<float>(), scratch.mutable_data_ptr<float>(), kv_heads, pages,
+      blocks_per_row, page_log_mass.stride(0), page_log_mass.stride(1), page_log_mass.stride(2));
+  select_pages_grouped_kernel<<<static_cast<unsigned int>(rows), kSelectThreads, 0, stream>>>(
+      page_log_mass.mutable_data_ptr<float>(), scratch.mutable_data_ptr<float>(),
+      pages_output.mutable_data_ptr<int64_t>(), support_ids.mutable_data_ptr<int64_t>(),
+      historical, end, kv_heads, pages, blocks_per_row,
+      page_log_mass.stride(0), page_log_mass.stride(1), page_log_mass.stride(2));
   assert(cudaGetLastError() == cudaSuccess);
-}
-
-// page_log_mass [B, G, 4, pages] from page_lse; pages_output [B, G, routed] int64;
-// support_ids [B, G, routed * 32 + (end - historical)] int64 with -1 padding.
-void select_pages(const at::Tensor& page_log_mass, const at::Tensor& pages_output,
-                  const at::Tensor& support_ids, int64_t historical, int64_t end,
-                  int64_t pinned_prefix_pages) {
-  launch_select<false>(page_log_mass, pages_output, support_ids, nullptr, nullptr, nullptr, nullptr,
-                       nullptr, 0, historical, end, pinned_prefix_pages);
 }
 
 // select_pages plus the Key slot cache refresh. host_key_pointer addresses [B, G, C, 128];
@@ -816,8 +692,8 @@ void select_pack_refresh(const at::Tensor& page_log_mass, const at::Tensor& page
                          const at::Tensor& support_ids, int64_t host_key_pointer,
                          const at::Tensor& cache, const at::Tensor& resident,
                          const at::Tensor& lookup, const at::Tensor& slots,
-                         const at::Tensor& missing, const at::Tensor& counts, int64_t historical,
-                         int64_t end, int64_t pinned_prefix_pages) {
+                         const at::Tensor& missing, const at::Tensor& counts, const at::Tensor& scratch,
+                         int64_t historical, int64_t end) {
   const int64_t rows = page_log_mass.size(0) * page_log_mass.size(1);
   const int64_t support_count = support_ids.size(2), capacity = lookup.size(2);
   for (const at::Tensor* tensor : {&cache, &resident, &lookup, &slots, &missing, &counts}) {
@@ -831,11 +707,14 @@ void select_pack_refresh(const at::Tensor& page_log_mass, const at::Tensor& page
   assert(slots.numel() == rows * support_count && missing.numel() == rows * support_count);
   assert(counts.numel() == rows * 2);
 
-  launch_select<true>(page_log_mass, pages_output, support_ids, resident.mutable_data_ptr<int64_t>(),
-                      lookup.mutable_data_ptr<int>(), slots.mutable_data_ptr<int64_t>(),
-                      missing.mutable_data_ptr<int>(), counts.mutable_data_ptr<int>(),
-                      static_cast<int>(capacity), historical, end, pinned_prefix_pages);
+  select_pages(page_log_mass, pages_output, support_ids, scratch, historical, end);
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream(page_log_mass.get_device()).stream();
+  plan_slots_kernel<<<static_cast<unsigned int>(rows), kThreads, 0, stream>>>(
+      support_ids.const_data_ptr<int64_t>(), resident.mutable_data_ptr<int64_t>(),
+      lookup.mutable_data_ptr<int>(), slots.mutable_data_ptr<int64_t>(),
+      missing.mutable_data_ptr<int>(), counts.mutable_data_ptr<int>(),
+      static_cast<int>(capacity), static_cast<int>(support_count));
+  assert(cudaGetLastError() == cudaSuccess);
   const int vectors = static_cast<int>(rows * support_count) * (kQueryKeyDim / 8);
   fetch_missing_kernel<<<(vectors + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(host_key_pointer),
@@ -849,7 +728,8 @@ void select_pack_refresh(const at::Tensor& page_log_mass, const at::Tensor& page
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   namespace py = pybind11;
-  module.doc() = "Page32 B16R16 GQA4 conditional router: append, page scan, selection, slot refresh";
+  module.doc() = "Page4 B16R16 GQA4 conditional router: append, page scan, selection, slot refresh";
+  module.def("selection_workspace_size", []() { return kScratchWords; });
   module.def("host_key_buffer", &host_key_buffer, py::arg("batch"), py::arg("kv_heads"),
              py::arg("capacity"));
   module.def("device_pointer", &device_pointer, py::arg("host_key"));
@@ -865,11 +745,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("value_cache"), py::arg("base_cache"), py::arg("residual_cache"),
              py::arg("start"), py::arg("host_key_pointer") = 0);
   module.def("select_pages", &select_pages, py::arg("page_log_mass"), py::arg("pages"),
-             py::arg("support_ids"), py::arg("historical"), py::arg("end"),
-             py::arg("pinned_prefix_pages") = 1);
+             py::arg("support_ids"), py::arg("scratch"), py::arg("historical"), py::arg("end"));
   module.def("select_pack_refresh", &select_pack_refresh, py::arg("page_log_mass"),
              py::arg("pages"), py::arg("support_ids"), py::arg("host_key_pointer"),
              py::arg("cache"), py::arg("resident"), py::arg("lookup"), py::arg("slots"),
-             py::arg("missing"), py::arg("counts"), py::arg("historical"), py::arg("end"),
-             py::arg("pinned_prefix_pages") = 1);
+             py::arg("missing"), py::arg("counts"), py::arg("scratch"),
+             py::arg("historical"), py::arg("end"));
 }

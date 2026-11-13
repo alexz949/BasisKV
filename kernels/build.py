@@ -41,11 +41,11 @@ def load_cuda_extension(name, sources, *, cuda_flags=(), nccl=False, build_direc
         assert (package / 'include/nccl.h').is_file() and (package / 'lib/libnccl.so.2').is_file()
         includes.append(package / 'include')
         libraries = [f'-L{package / "lib"}', '-l:libnccl.so.2', f'-Wl,-rpath,{package / "lib"}']
-    selected = build_directory or os.environ.get('BASISSERVE_EXT_BUILD_DIR')
+    selected = build_directory or os.environ.get('BASISKV_EXT_BUILD_DIR')
     directory = Path(selected).expanduser().resolve() / name if selected else None
     if directory is not None:
         directory.mkdir(parents=True, exist_ok=True)
-    verbose = os.environ.get('BASISSERVE_VERBOSE_BUILD', '0') == '1' if verbose is None else verbose
+    verbose = os.environ.get('BASISKV_VERBOSE_BUILD', '0') == '1' if verbose is None else verbose
     lock = Path(tempfile.gettempdir()) / f'{name}.{os.getuid()}.lock'
     with lock.open('w') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)

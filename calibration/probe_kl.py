@@ -39,6 +39,12 @@ def bank_modules(model, banks):
     """{rank: {layer: ValueAttention}} folded from the uniform banks; the natives are the teacher."""
     natives = attention_layers(model)
     modules = {}
+    if model.config.model_type.startswith('qwen3_5'):
+        from inference.qwen35 import GatedVAttention, load_bank
+        for rank, directory in banks.items():
+            factors = load_bank(directory / 'value.pt')['layers']
+            modules[rank] = {layer: GatedVAttention(natives[layer], factors[layer]['E_V'], factors[layer]['R_V']) for layer in natives}
+        return natives, modules
     for rank, directory in banks.items():
         results = read_results(directory)
         modules[rank] = {}
@@ -76,7 +82,7 @@ def kl_to_teacher(teacher, model, input_ids):
     return total, teacher.shape[0] * teacher.shape[1]
 
 
-def measure(model, windows, natives, modules, *, anchor, low, high, layers, batch_size):
+def measure(model, windows, natives, modules, *, anchor, low, high, layers, batch_size, gdn_modules=None):
     """KL sums over all windows for the anchor model and every layer probe."""
     sums = {"anchor": 0.0, **{(layer, rank): 0.0 for layer in layers for rank in (low, high)}}
     positions = 0
@@ -84,7 +90,13 @@ def measure(model, windows, natives, modules, *, anchor, low, high, layers, batc
         input_ids = windows[start : start + batch_size].to(next(model.parameters()).device).long()
         for layer, native in natives.items():
             set_layer(model, layer, native)
+        if gdn_modules:
+            for layer, (dense, compact) in gdn_modules.items():
+                model.model.layers[layer].linear_attn.out_proj = dense
         teacher = log_probabilities(model, input_ids)
+        if gdn_modules:
+            for layer, (dense, compact) in gdn_modules.items():
+                model.model.layers[layer].linear_attn.out_proj = compact
         for layer in natives:
             set_layer(model, layer, modules[anchor][layer])
         total, count = kl_to_teacher(teacher, model, input_ids)
@@ -134,6 +146,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", stream=sys.stdout)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", type=Path, required=True, help="local Hugging Face model directory")
+    parser.add_argument("--gdn-bank", type=Path, help="fixed Qwen3.5 GDN output factors used in every allocation probe")
     parser.add_argument("--windows", type=Path, required=True, help="profile windows (input_ids) from calibration.windows")
     parser.add_argument("--banks", nargs="+", required=True, metavar="RANK=DIR", help="uniform banks of the anchor and both probe ranks")
     parser.add_argument("--anchor-rank", type=int, required=True)
@@ -162,17 +175,24 @@ def main(argv=None):
     windows = load_file(str(args.windows))["input_ids"]
     windows = windows[: args.window_count or len(windows), : args.sequence_length or windows.shape[1]]
     model = load_model(args.model, dtype=args.dtype, device=args.device, device_map=args.device_map)
+    gdn_modules = None
+    if args.gdn_bank is not None:
+        dense_gdn = {i: block.linear_attn.out_proj for i, block in enumerate(model.model.layers) if hasattr(block, 'linear_attn')}
+        from inference.model import install_factors
+        install_factors(model, gdn_bank=args.gdn_bank)
+        gdn_modules = {i: (module, model.model.layers[i].linear_attn.out_proj) for i, module in dense_gdn.items()}
     natives, modules = bank_modules(model, banks)
     layers = list(natives)[args.layer_shard_index :: args.layer_shard_count]
     started = time.monotonic()
     anchor_kl, positions, rows = measure(
         model, windows, natives, modules, anchor=args.anchor_rank, low=args.low_rank, high=args.high_rank,
-        layers=layers, batch_size=args.batch_size,
+        layers=layers, batch_size=args.batch_size, gdn_modules=gdn_modules,
     )
     write_json(shard_path(args.output, args.layer_shard_index, args.layer_shard_count), {
         "format": PROBES_FORMAT,
         "model": str(args.model.resolve()),
         "model_config_sha256": model_hash,
+        "gdn_bank_sha256": sha256(args.gdn_bank) if args.gdn_bank else None,
         "banks": {str(rank): str(directory) for rank, directory in banks.items()},
         "anchor_rank": args.anchor_rank,
         "low_rank": args.low_rank,

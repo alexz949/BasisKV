@@ -4,6 +4,7 @@ import argparse
 import statistics
 
 from benchmarks.common import add_model_arguments, arguments, load_model, metadata, prompts, save
+from kernels.routing_config import PAGE_SIZE, PINNED_PAGES, ROUTED_TOKENS, RECENT_TOKENS, SUPPORT
 
 
 def main():
@@ -13,7 +14,7 @@ def main():
     parser.add_argument('--sample-row', type=int, default=0)
     parser.add_argument('--profile-steps', type=int, default=32)
     args = parser.parse_args()
-    assert min(args.contexts) > 2048 and not args.output.exists(), 'contexts must exceed the routed budget, and the output must be new'
+    assert min(args.contexts) > SUPPORT and not args.output.exists(), 'contexts must exceed the support budget, and the output must be new'
     assert (args.router_dir is not None) == (args.arm == 'basis') and (args.arm != 'dense' or args.value_factors is None), 'basis takes --router-dir; dense takes neither factors nor router'
     import torch
     from benchmarks.attention import install
@@ -22,12 +23,13 @@ def main():
     torch.set_num_threads(2)
     torch.manual_seed(20260924)
     torch.backends.cuda.matmul.allow_tf32 = False
-    model = load_model(args.model)
+    model = load_model(args.model, config_path=args.config)
     capacity = max(args.contexts) + args.warmup_steps + max(args.decode_steps, args.profile_steps)
     layers, _ = install(model, args, batch=1, capacity=capacity)
     result = dict(schema='basiskv.benchmark.decode.v1', status='running', arguments=arguments(args), environment=metadata(), contexts=[],
-        protocol=dict(tp=1, batch=1, key_placement='gpu', value_placement='gpu', page_size=32,
-            routed_tokens=1984, recent_tokens=64, timing='Prefill excluded; CUDA-event full-model decode. Attention includes append, routing, and attention, excludes QKV/O projection. Separate attribution run.'))
+        protocol=dict(tp=1, batch=1, key_placement='gpu', value_placement='gpu', page_size=PAGE_SIZE,
+            pinned_pages=PINNED_PAGES, routed_tokens=ROUTED_TOKENS, recent_tokens=RECENT_TOKENS,
+            support_tokens=SUPPORT, timing='Prefill excluded; CUDA-event full-model decode. Attention includes append, routing, and attention, excludes QKV/O projection. Separate attribution run.'))
     for length in args.contexts:
         prompt = prompts(args.tokens, 1, length, args.sample_row)
         print(f'context={length} phase=warmup', flush=True)

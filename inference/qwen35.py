@@ -25,10 +25,10 @@ def factor_hash(bank):
 
 
 def _schema_checked_update(cache, key_states, value_states, layer_idx, cache_kwargs=None):
-    expected = cache._basisserve_v_schemas.get(layer_idx)
+    expected = cache._basiskv_v_schemas.get(layer_idx)
     if expected is not None:
-        assert (cache_kwargs or {}).get('basisserve_v_schema') == expected, 'Dense/latent cache or factor bank mismatch'
-    return cache._basisserve_native_update(key_states, value_states, layer_idx, cache_kwargs)
+        assert (cache_kwargs or {}).get('basiskv_v_schema') == expected, 'Dense/latent cache or factor bank mismatch'
+    return cache._basiskv_native_update(key_states, value_states, layer_idx, cache_kwargs)
 
 
 class GatedVAttention(nn.Module):
@@ -71,16 +71,16 @@ class GatedVAttention(nn.Module):
         if self.router is not None:
             append_sidecar(past_key_values, self.layer_idx, v, k, position_embeddings, self.router)
         if past_key_values is not None:
-            schemas = getattr(past_key_values, '_basisserve_v_schemas', {})
+            schemas = getattr(past_key_values, '_basiskv_v_schemas', {})
             existing = past_key_values.layers[self.layer_idx].values
             assert existing is None or schemas.get(self.layer_idx) == self.schema, 'Dense/latent cache or factor bank mismatch'
             schemas[self.layer_idx] = self.schema
-            past_key_values._basisserve_v_schemas = schemas
-            if not hasattr(past_key_values, '_basisserve_native_update'):
-                past_key_values._basisserve_native_update = past_key_values.update
+            past_key_values._basiskv_v_schemas = schemas
+            if not hasattr(past_key_values, '_basiskv_native_update'):
+                past_key_values._basiskv_native_update = past_key_values.update
                 past_key_values.update = MethodType(_schema_checked_update, past_key_values)
             k, v = past_key_values.update(k, v, self.layer_idx,
-                {'cache_position': cache_position, 'basisserve_v_schema': self.schema})
+                {'cache_position': cache_position, 'basiskv_v_schema': self.schema})
         mapping = torch.arange(heads, device=q.device) // n.num_key_value_groups
         group_mapping = mapping // self.kv_per_group
         latent = self.attention(q, k, v, pre_key=pre_key, position_embeddings=position_embeddings,
@@ -164,7 +164,7 @@ class GatedVRuntime:
 
 def load_bank(path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
-    assert payload['format'] == 'basisserve.qwen35.gated_v_als.v1', f'{path} is not a gated-V bank'
+    assert payload['format'] == 'basiskv.qwen35.gated_v_als.v1', f'{path} is not a gated-V bank'
     return payload
 
 
@@ -173,7 +173,7 @@ def qwen35_decoder_layers(model):
     return getattr(body, 'language_model', body).layers
 
 
-FACTOR_FORMAT = 'basisserve.qwen35.gdn_private_ag_joint_factors.v2'
+FACTOR_FORMAT = 'basiskv.qwen35.gdn_private_ag_joint_factors.v2'
 
 
 def load_qwen35_gdn_private_ag_factors(path):

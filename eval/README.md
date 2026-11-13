@@ -39,22 +39,62 @@ validation windows built by `calibration.windows --split validation
 Use `--dataset wikitext2` or `--dataset c4` to run one dataset. `--limit` records
 a partial evaluation.
 
+## Prepare long-context inputs
+
+Prepare the official RULER-v1 generator and its source data:
+
+```bash
+git clone --branch main https://github.com/NVIDIA/RULER external/RULER
+pip install nltk wonderwords tenacity html2text beautifulsoup4 pyyaml
+(
+  cd external/RULER/scripts/data/synthetic/json
+  python download_paulgraham_essay.py
+  bash download_qa_dataset.sh
+)
+python -m eval.prepare_data ruler --ruler-root external/RULER --model MODEL \
+  --sequence-length 131072 --samples 100 --seed 42 --output outputs/ruler_data
+python -m eval.prepare_data longbench --output outputs/longbench_data
+```
+
+Use `outputs/ruler_data` for `RULER_DATA` and `outputs/longbench_data` for
+`LONGBENCH_JSONL`. RULER prompts must be generated with the evaluated model's
+tokenizer. The preparation command writes the manifest read by `eval.ruler`.
+The main evaluator chooses the ten paper tasks; the generated data also include
+the tasks used by the appendix.
+
+For Qwen3-8B at 128K, prepare the paper's static YaRN configuration:
+
+```bash
+python -m calibration.context_config --model MODEL --output outputs/qwen3_128k
+```
+
+Pass `--config outputs/qwen3_128k` to both router capture stages and to the
+long-context evaluation commands. The model weights and tokenizer still come
+from `--model MODEL`.
+
 ## RULER and LongBench
 
 ```bash
 python -m eval.ruler --model MODEL --value-factors FACTORS \
-  --data RULER_DATA --method basiskv --router ROUTER --output RULER_OUTPUT
+  --data RULER_DATA --method basiskv --router ROUTER \
+  --page-size 4 --pinned-pages 0 --routed-tokens 2048 --output RULER_OUTPUT
 python -m eval.longbench --model MODEL --value-factors FACTORS \
-  --data LONGBENCH_JSONL --method basiskv --router ROUTER --output LONGBENCH_OUTPUT
+  --data LONGBENCH_JSONL --method basiskv --router ROUTER \
+  --page-size 4 --pinned-pages 0 --routed-tokens 256 --output LONGBENCH_OUTPUT
 ```
 
 `ROUTER` is the directory written by `core.fit_router fit`. The default page
 size is 4. RULER selects 2,048 historical tokens per KV group and LongBench
 selects 256; both retain 64 additional recent tokens, with no pinned sink page.
+The total support budgets are therefore 2,112 and 320 tokens, respectively.
 `--page-size` and `--pinned-pages` should match the router's calibration, which
 uses `calibration.router ... --page-size 4 --pinned-pages 0` (both are
-defaults). With `--pinned-pages 1` the first page is always selected and counts
-toward the routed-token budget, as in the appendix's Page32 control.
+defaults). `--routed-tokens` counts all selected historical tokens, including
+any pinned prefix; the 64 recent tokens are additional. For Page32 with one
+pinned page and a total budget of 2,048, pass
+`--page-size 32 --pinned-pages 1 --routed-tokens 1984`: 32 pinned tokens plus
+1,952 score-selected tokens plus 64 recent tokens. See the appendix guide for
+the Table 8 control and the Page4 Table 11 commands.
 Base/residual ranks are read from the router record; use the paper's B16R16
 factors for its main comparison. Use the same Value factors that calibrated the
 router. Record fingerprints are retained in the output.
@@ -63,7 +103,7 @@ Use `--method full` and omit `--router` for the Full-K control on the same Value
 checkpoint. Omitting Value factors as well evaluates the original dense model.
 The generic main runners implement Full-K and BasisKV.
 
-RULER takes externally prepared seed-42 data in `<task>/validation.jsonl`.
+RULER takes the prepared seed-42 data in `<task>/validation.jsonl`.
 Each record contains `input`, `outputs` (a list of reference answers), and an
 optional `answer_prefix`. The data directory must also contain `manifest.json`
 with `status: "complete"` and `protocol.sequence_length` matching the evaluation

@@ -52,7 +52,7 @@ factors. This example retains 96 Value dimensions per KV head.
 ```bash
 python -m calibration.windows \
   --model MODEL --output outputs/windows --sequence-length 2048 \
-  --fit-windows 32 --heldout-windows 16
+  --fit-windows 256 --heldout-windows 64
 python -m calibration.value \
   --model MODEL --windows outputs/windows/windows.safetensors \
   --output outputs/statistics
@@ -61,34 +61,132 @@ python -m core.fit_value fit-shard \
 python -m core.fit_value merge --output-dir outputs/value
 ```
 
-For layerwise rank allocation, fit uniform banks at candidate ranks, collect
-KL probes with `calibration.probe_kl`, then select ranks with `core.allocate`.
-The directory it writes is used like a uniform bank, including by the
-tensor-parallel benchmark (`benchmarks.tp`), which serves each layer at its own rank.
-Use `python -m <module> --help` for each entrypoint's options.
+#### Adaptive Value allocation: 50% and 75% retention
+
+Adaptive allocation assigns a rank to each layer under a global budget.
+For Llama and Qwen3 models with 128-dimensional KV heads, average ranks 64 and
+96 retain 50% and 75% of the Value dimensions, respectively. Each layer gets
+one rank shared by its physical KV heads; Keys remain dense.
+
+The following Bash commands run the allocation workflow at both budgets. Use
+a separate output directory for each model. The calibration uses 256 C4 fit
+windows and 64 held-out windows, each 2,048 tokens long. Candidate factors
+share these statistics and use six ALS sweeps, 16 CG iterations, FP32 fitting,
+and BF16 storage. Rank 128 is the exact dense endpoint.
+
+```bash
+python -m calibration.windows \
+  --model MODEL --output outputs/adaptive/windows --sequence-length 2048 \
+  --fit-windows 256 --heldout-windows 64 --seed 20260821
+python -m calibration.value \
+  --model MODEL --windows outputs/adaptive/windows/windows.safetensors \
+  --output outputs/adaptive/statistics
+
+banks=()
+for rank in 32 48 64 80 96 112 128; do
+  python -m core.fit_value fit-shard \
+    --snapshot-dir outputs/adaptive/statistics \
+    --output-dir "outputs/adaptive/banks/R${rank}" --rank "$rank" \
+    --encoder-sweeps 6 --cg-iterations 16 --covariance-damping 1e-7 \
+    --work-dtype float32 --factor-dtype bfloat16
+  python -m core.fit_value merge --output-dir "outputs/adaptive/banks/R${rank}"
+  banks+=("${rank}=outputs/adaptive/banks/R${rank}")
+done
+```
+
+Next, prepare a separate C4 profiling bank and measure output KL against the
+dense model. Both budgets use the same uniform rank-64 anchor: each probe
+changes just one layer to rank 32 or 96 while keeping the other layers at 64.
+
+```bash
+python -m calibration.windows \
+  --model MODEL --output outputs/adaptive/profile --sequence-length 2048 \
+  --fit-windows 128 --heldout-windows 0 --seed 20260828
+python -m calibration.probe_kl \
+  --model MODEL --windows outputs/adaptive/profile/windows.safetensors \
+  --banks 32=outputs/adaptive/banks/R32 64=outputs/adaptive/banks/R64 \
+          96=outputs/adaptive/banks/R96 \
+  --anchor-rank 64 --low-rank 32 --high-rank 96 \
+  --window-count 128 --sequence-length 2048 --batch-size 1 \
+  --output outputs/adaptive/probes
+
+# Run in the same Bash session as the bank-fitting loop above.
+for target in 64 96; do
+  python -m core.allocate --banks "${banks[@]}" \
+    --probes outputs/adaptive/probes/probes.json \
+    --target-average-rank "$target" --output "outputs/adaptive/V${target}"
+done
+```
+
+`core.allocate` selects ranks by exact-budget dynamic programming and assembles
+the chosen layer factors into `outputs/adaptive/V64` and `outputs/adaptive/V96`.
+Their `results.json` files record the layer ranks and allocation settings.
+Evaluate these assembled directories for the adaptive quality results:
+
+```bash
+python -m calibration.windows \
+  --model MODEL --output outputs/adaptive/c4_validation --split validation \
+  --sequence-length 2048 --fit-windows 128 --heldout-windows 0 --seed 20260828
+for target in 64 96; do
+  python -m eval.ppl --model MODEL --value-factors "outputs/adaptive/V${target}" \
+    --dataset both --c4-windows outputs/adaptive/c4_validation/windows.safetensors \
+    --sequence-length 2048 --batch-size 2 \
+    --output "outputs/adaptive/eval/V${target}/ppl"
+  python -m eval.mcq --model MODEL --value-factors "outputs/adaptive/V${target}" \
+    --output "outputs/adaptive/eval/V${target}/mcq"
+done
+```
+
+The same assembled directories can be passed to `benchmarks.tp --value-factors`
+to measure each adaptive configuration; see the
+[TP benchmark commands](benchmarks/README.md#commands). The router example
+below continues to use the uniform V96 factors from the initial Quick Start.
 
 ### 2. Fit the Page-Fisher router
 
-Use the merged Value factors and calibration windows at your target context
-length (`ROUTING_WINDOWS/windows.safetensors`, prepared with `calibration.windows`).
-The model must support that length; pass `--config` to both capture commands
-when using an extended-context configuration.
+Prepare a routing calibration bank with **16 C4 + 16 synthetic fit windows
+and 16 held-out C4 windows**, each 131,072 tokens long. The commands below
+generate the C4 and synthetic data, then assemble the mixed bank:
+
+```bash
+python -m calibration.windows \
+  --model MODEL --output outputs/routing_c4 --sequence-length 131072 \
+  --fit-windows 32 --heldout-windows 16 --seed 20260921
+python -m calibration.retrieval \
+  --model MODEL --exclude-manifest outputs/routing_c4/manifest.json \
+  --seed 20260922 --haystack-seed 20260923 --output outputs/routing_retrieval
+python -m calibration.mix_windows \
+  --c4 outputs/routing_c4 --synthetic outputs/routing_retrieval \
+  --output outputs/routing_windows
+```
+
+The synthetic data cover multikey retrieval, multivalue retrieval, variable
+tracking, and aggregation. The assembled bank contains `windows.safetensors`
+and a `manifest.json` identifying the fit and held-out windows.
+
+Use the merged Value factors and `outputs/routing_windows/windows.safetensors`
+for both capture stages below. For Qwen3-8B, create the [static YaRN configuration](eval/README.md#prepare-long-context-inputs).
+The model must support 131,072 tokens; pass
+`--config` to both capture commands when using an extended-context configuration.
 
 ```bash
 python -m calibration.router moments \
   --model MODEL --value-factors outputs/value \
-  --windows ROUTING_WINDOWS/windows.safetensors --output outputs/routing
+  --windows outputs/routing_windows/windows.safetensors --output outputs/routing \
+  --page-size 4 --pinned-pages 0
 python -m core.fit_router base \
   --statistics-dir outputs/routing --output-dir outputs/routing/base --base-rank 16
 python -m calibration.router fisher \
   --model MODEL --value-factors outputs/value \
-  --windows ROUTING_WINDOWS/windows.safetensors --output outputs/routing
+  --windows outputs/routing_windows/windows.safetensors --output outputs/routing \
+  --page-size 4 --pinned-pages 0
 python -m core.fit_router fit \
   --statistics-dir outputs/routing --output-dir outputs/router --residual-rank 16
 ```
 
-Defaults are base rank 16, residual rank 16, page size 4, and no pinned prefix
-pages. Use the same capture settings and Value factors for both stages.
+This example fits B16R16 with Page4 and no pinned prefix pages. Use the same
+capture settings and Value factors for both stages. B16R16 specifies the Base
+and residual dimensions; page size and token budget are configured separately.
 
 ### 3. Evaluate
 
@@ -99,11 +197,13 @@ python -m eval.ppl --model MODEL --value-factors outputs/value \
   --dataset wikitext2 --output outputs/ppl
 ```
 
-For routed long-context evaluation, supply the router and prepared benchmark data:
+Prepare RULER and LongBench inputs using the [data commands](eval/README.md#prepare-long-context-inputs),
+then evaluate with the fitted router:
 
 ```bash
 python -m eval.ruler --model MODEL --value-factors outputs/value \
-  --method basiskv --router outputs/router --data RULER_DATA --output outputs/ruler
+  --method basiskv --router outputs/router --data RULER_DATA \
+  --page-size 4 --pinned-pages 0 --routed-tokens 2048 --output outputs/ruler
 ```
 
 | Evaluation | Entrypoint | Instructions |
@@ -112,15 +212,18 @@ python -m eval.ruler --model MODEL --value-factors outputs/value \
 | Throughput, latency, memory | `benchmarks.tp`, `benchmarks.decode`, `benchmarks.memory` | [Performance benchmarks](benchmarks/README.md) |
 | Appendix experiments | `appendix/` | [Appendix](appendix/README.md) |
 
-Quality evaluation uses Page4 routers; CUDA routing benchmarks use Page32 and
-need separately fitted routers. See the linked instructions for data preparation,
-context configuration, supported runtimes, and paper protocols.
+Main quality evaluation uses Page4 without a pinned prefix: RULER selects
+2,048 historical tokens plus 64 recent tokens (2,112 total), and LongBench
+selects 256 plus 64 (320 total). CUDA routing benchmarks use the same Page4,
+no-sink configuration as RULER, with 2,048 selected historical tokens and 64
+recent tokens. See the benchmark guide for system commands and the appendix
+guide for table-specific evaluation commands.
 
 ## Repository Structure
 
 ```text
 core/          Joint V/O ALS, rank allocation, and Page-Fisher fitting
-calibration/   Calibration windows, activation statistics, and KL probes
+calibration/   C4 and synthetic routing windows, activation statistics, and KL probes
 inference/     Hugging Face and tensor-parallel vLLM adapters
 kernels/       CUDA and Triton attention, routing, and communication
 eval/          Quality evaluation
@@ -131,3 +234,5 @@ tests/         Compact tensor-parallel adapter verification
 
 Model weights, datasets, fitted factors, and experiment outputs are supplied
 separately. The commands above generate calibration windows and fitted factors.
+
+For Qwen3.5 gated Value and Gated-DeltaNet fitting, see [calibration](calibration/README.md).

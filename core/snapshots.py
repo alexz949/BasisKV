@@ -10,7 +10,7 @@ import json
 import torch
 from safetensors.torch import load_file
 
-COVARIANCE_FORMAT = "basisserve.attention_o_proj_covariances.v1"
+COVARIANCE_FORMAT = "basiskv.attention_o_proj_covariances.v1"
 
 
 def read_manifest(snapshot_dir):

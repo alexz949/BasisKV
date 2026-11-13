@@ -63,19 +63,6 @@ def fold_value_weight(dense_value, encoder):
     return (encoder.float().mT @ weight).reshape(groups * rank, -1).to(dense_value.dtype)
 
 
-def folded_projection_weights(dense_value, encoder, decoder):
-    """Put latent coordinates in ordinary dense V/O slots for quality evaluation."""
-    groups, dim, rank = encoder.shape
-    heads, _, hidden = decoder.shape
-    value = torch.zeros_like(dense_value).reshape(groups, dim, hidden)
-    value[:, :rank] = fold_value_weight(dense_value, encoder).reshape(groups, rank, hidden)
-    output = decoder.new_zeros(heads, dim, hidden, device=dense_value.device, dtype=dense_value.dtype)
-    output[:, :rank] = decoder.to(output)
-    return value.flatten(0, 1), output.permute(2, 0, 1).reshape(hidden, heads * dim)
-
-
-
-
 class ChunkedTokenwise(torch.nn.Module):
     def __init__(self, inner, chunk_size=1024):
         super().__init__()
@@ -91,20 +78,6 @@ class ChunkedTokenwise(torch.nn.Module):
             output[:, start:stop] = self.inner(hidden_states[:, start:stop],
                 *(value[:, start:stop] for value in tokenwise_inputs))
         return output
-
-
-def install_chunked_prefill_mlps(model):
-    for layer in model.model.layers:
-        layer.mlp = ChunkedTokenwise(layer.mlp)
-
-
-def install_chunked_prefill_norms(model):
-    for layer in model.model.layers:
-        layer.input_layernorm = ChunkedTokenwise(layer.input_layernorm)
-        layer.post_attention_layernorm = ChunkedTokenwise(layer.post_attention_layernorm)
-        layer.self_attn.q_norm = ChunkedTokenwise(layer.self_attn.q_norm)
-        layer.self_attn.k_norm = ChunkedTokenwise(layer.self_attn.k_norm)
-    model.model.norm = ChunkedTokenwise(model.model.norm)
 
 
 def chunk_tokenwise_prefill(model, tokens):

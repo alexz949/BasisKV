@@ -1,7 +1,7 @@
 """Shared resident and host-Key attention for the decode and memory benchmarks.
 
-CUDA routing remains GQA4 / QK128 / Page32 / B16R16. Value factors use the
-current core.fit_value manifest. Quality evaluation has a separate Page4 path.
+CUDA routing uses GQA4 / QK128 / Page4 / B16R16, no pinned prefix, and
+2,048 historical tokens plus 64 recent tokens. Value factors use core.fit_value.
 """
 
 import math
@@ -19,9 +19,9 @@ from inference.tp import ChunkedTokenwise, fold_value_weight, head_slices, load_
 from kernels.allgather import AllGather
 from kernels.decode import PAGE_SIZE, load_paged_attention, load_router
 from kernels.sparse_attention import sparse_attention
+from kernels.routing_config import PINNED_PAGES, ROUTED_PAGES, RECENT_TOKENS, SUPPORT
 
-ROUTED_PAGES, RECENT_TOKENS, SPLITS = 62, 64, 16
-SUPPORT = PAGE_SIZE * ROUTED_PAGES + RECENT_TOKENS
+SPLITS = 16
 
 
 def local_weight(weight):
@@ -69,6 +69,7 @@ class Attention(nn.Module):
             self.query_code = torch.empty(batch, groups, 4, 16, device=device, dtype=dtype)
             self.scores = torch.empty(batch, groups, 4, math.ceil(capacity / PAGE_SIZE), device=device)
             self.pages = torch.empty(batch, groups, ROUTED_PAGES, device=device, dtype=torch.long)
+            self.selection_scratch = torch.empty(batch, groups, router.selection_workspace_size(), device=device, dtype=torch.float32)
             self.support_ids = torch.empty(batch, groups, SUPPORT, device=device, dtype=torch.long)
             if host_keys:
                 self.slot_keys = torch.empty(batch, groups, SUPPORT, self.dim, device=device, dtype=dtype)
@@ -143,12 +144,12 @@ class Attention(nn.Module):
             self.shared_rope['cos'][:historical], self.shared_rope['sin'][:historical],
             self.query_code, scores, self.scaling)
         if self.host_key is None:
-            self.router.select_pages(scores, self.pages, self.support_ids, historical, end, 1)
+            self.router.select_pages(scores, self.pages, self.support_ids, self.selection_scratch, historical, end)
             keys, slots = self.key_cache, self.support_ids
         else:
             self.router.select_pack_refresh(scores, self.pages, self.support_ids, self.key_pointer,
                 self.slot_keys, self.resident, self.lookup, self.selected_slots, self.missing, self.counts,
-                historical, end, 1)
+                self.selection_scratch, historical, end)
             keys, slots = self.slot_keys, self.selected_slots
         return sparse_attention(query, keys, self.value_cache, self.support_ids, key_slots=slots,
             workspace=(self.partial, self.lse, self.output), scale=self.scaling)
@@ -243,6 +244,8 @@ def install(model, args, *, batch, capacity, rank=0, world=1, host_keys=False):
             payload, protocol = router_factors(args.router_dir, index)
             base, residual = protocol['base_rank'], protocol['residual_rank']
             assert base == residual == 16, 'the register router kernel is compiled for B16R16'
+            assert protocol['page_size'] == PAGE_SIZE and protocol['excluded_prefix_pages'] == PINNED_PAGES
+            assert protocol['excluded_recent_tokens'] == RECENT_TOKENS
             if encoder is not None:
                 # The paper stores Base inside V: T=[L,Q_perp], c'=cT and D'=T^-1 D.
                 left = payload['base_left_b16'].double()

@@ -77,47 +77,29 @@ compiler explicitly:
 export CC=$(command -v g++) CXX=$(command -v g++)
 ```
 
-Set `BASISSERVE_EXT_BUILD_DIR` to keep the built extensions between runs.
+Set `BASISKV_EXT_BUILD_DIR` to keep the built extensions between runs.
 
 ## Verification
+
+Run the offline calibration-to-inference CPU smoke with the base environment:
+
+```bash
+python -m unittest tests.test_standalone tests.test_routing_windows -v
+```
+
+
+Check Page4 routing, resident/host-Key selection, and attention on an sm_80+
+CUDA GPU with the base environment:
+
+```bash
+python -m unittest tests.test_page4_router -v
+```
 
 Run from the repository root after installing `requirements-tp.txt`:
 
 ```bash
 python -m tests.test_compact_tp
 ```
-
-Verification status of the Llama/Qwen3 `tp.py` path in this repository state:
-
-- Verified on CPU (`python -m tests.test_compact_tp`, clean environment): both
-  adapters with uniform V64 and V96 and with a per-layer bank of ranks
-  `[32, 96, 128, 64]` assembled by `core.factor_io.assemble`, against the HF
-  reference with the same factors, teacher-forced over one prompt and four
-  decode steps (relative logit error below 2e-6 in FP32, identical top-1 at
-  every position). The per-layer bank runs at TP 8, 4, 2, and 1; every TP
-  rank is built. TP8 uses a two-chunk prefill, while TP1/2/4 use a
-  whole-prompt prefill. This covers factor loading and TP head ownership, the
-  folded V projection, Q/K norms, RoPE, weight loading, each layer's
-  collective width, and the decoder. The test also asks vLLM's cache planner
-  for the layout: every layer's page is `128 + r_l` wide and the pool per
-  block is exactly their sum.
-- Verified on GPUs (2 x RTX A5000, TP 2, the environment above installed from
-  scratch): `python -m benchmarks.tp` end to end for synthetic Llama and Qwen3
-  checkpoints with the served layout (`head_dim` 128, 8 query heads, 2 KV
-  heads, so one KV head and 4 query heads per rank) and four banks each:
-  uniform V64, uniform V96, and per-layer `[32, 96, 128, 64]` and
-  `[48, 80, 112, 96]`. The prompts were longer than the per-step token budget,
-  so every request went through chunked prefill; decode ran under CUDA Graph
-  capture. Each rank reported the DiffKV implementation, the NCCL AllGather
-  output, cache tensors `128 + r_l` wide for every layer, and AllGather plans
-  of exactly `4 x r_l` local coordinates per layer; the allocated cache bytes
-  per token equaled the logical figure (3,328 and 3,392 against 4,096 dense
-  for the two per-layer banks). Fed back to the HF reference with the same
-  factors, the served token was the reference top-1 at 372 of 384 decode
-  steps; the other 12 were its second or third choice, within 0.06 logit
-  standard deviations, the level the dense arm shows on the same check. The
-  dense arm also completed for the real Llama-3.1-8B-Instruct and Qwen3-8B at
-  TP 2, matching the HF reference at 16 of 16 decode steps each.
 
 ## Inputs
 
@@ -139,13 +121,13 @@ Verification status of the Llama/Qwen3 `tp.py` path in this repository state:
   HF BasisKV can omit the factors for the dense-V routing control used in
   Table 3.
 - `--router-dir`: required for HF BasisKV. Current layer safetensors and JSON
-  records must follow the **Page32/B16R16** system protocol; only B16R16 is checked.
-  No pinned prefix; exact recent-64 tail. An incompatible Page4 quality bank
-  must be fitted separately for Page32 before using this CUDA benchmark.
+  records must follow **Page4/B16R16**, with `--pinned-pages 0` and an exact
+  recent-64 tail. The loader checks the ranks, page size, prefix, and recent
+  setting against the router's calibration record.
 
-The existing system kernel selects **62 × 32 = 1,984 routed tokens + 64 recent
-= 2,048 total support**. Main quality evaluation instead uses Page4 and its
-own routed-token budget. These protocols are recorded separately.
+The system kernel selects **512 × 4 = 2,048 historical tokens + 64 recent
+= 2,112 total support**, with no pinned prefix. Output records include the
+page size, pinned-page count, routed and recent budgets, and total support.
 
 HF attention derives layer/head counts from the model configuration and supports
 QK128 and V64/V96/V128. Routed execution requires four query heads per KV head;
@@ -156,9 +138,51 @@ The loader applies this coordinate change to the fitted Value factors.
 
 ## Commands
 
+Prepare token inputs with the served model's tokenizer. Use the same file for
+all methods in a comparison:
+
+```bash
+# Figure 3: enough independent 4K prompts for the largest cohort.
+python -m calibration.windows --model MODEL --split validation \
+  --sequence-length 4096 --fit-windows 256 --heldout-windows 0 \
+  --seed 42 --output outputs/tp_inputs
+# Table 3 and Figure 4: 128K prompts for the requested batch sizes.
+python -m calibration.windows --model MODEL --split validation \
+  --sequence-length 131072 --fit-windows 8 --heldout-windows 0 \
+  --seed 42 --output outputs/long_inputs
+```
+
+Set `--tokens` to the corresponding `windows.safetensors`; increase
+`--fit-windows` when measuring batches larger than eight at long context.
+
+Prepare a B16R16 Page4 router for the Value factors used by the HF benchmark.
+
+Prepare `ROUTING_WINDOWS/windows.safetensors` with the
+[mixed routing calibration workflow](../README.md#2-fit-the-page-fisher-router).
+Use the same Value factors and Page4 router for quality and system evaluation.
+
+```bash
+python -m calibration.router moments --model MODEL --value-factors FACTORS \
+  --windows ROUTING_WINDOWS/windows.safetensors --output PAGE4_CAPTURE \
+  --page-size 4 --pinned-pages 0
+python -m core.fit_router base --statistics-dir PAGE4_CAPTURE \
+  --output-dir PAGE4_CAPTURE/base --base-rank 16
+python -m calibration.router fisher --model MODEL --value-factors FACTORS \
+  --windows ROUTING_WINDOWS/windows.safetensors --output PAGE4_CAPTURE \
+  --page-size 4 --pinned-pages 0
+python -m core.fit_router fit --statistics-dir PAGE4_CAPTURE \
+  --output-dir PAGE4_ROUTER --residual-rank 16
+```
+
+For the dense-Value `PAGE4_V128_ROUTER` used below, replace
+`--value-factors FACTORS` with `--dense-v` in both capture commands, use a
+separate capture directory, and write the fitted router to `PAGE4_V128_ROUTER`.
+The input windows and model must support the target context length; use the
+same `--config` in both capture commands if extending the model context.
+Also pass that `--config` to `benchmarks.decode` and `benchmarks.memory`.
+
 Use the environment from the root README; `tp.py` needs its vLLM layer and
-`CUDA_HOME`. Run full benchmarks through Slurm with the
-requested GPUs; do not run them on the login node. The TP8 paper measurements
+`CUDA_HOME`. The TP8 paper measurements
 use eight L40S GPUs. Match hardware, input cohorts, and factors when comparing
 with the published numbers.
 
@@ -182,13 +206,13 @@ python -m benchmarks.tp --arm dense --model MODEL \
 
 # Table 3: all K/V resident, dense V, three trials per context.
 python -m benchmarks.decode --arm basis --model MODEL \
-  --router-dir PAGE32_V128_ROUTER --tokens TOKENS.safetensors \
+  --router-dir PAGE4_V128_ROUTER --tokens TOKENS.safetensors \
   --contexts 24576 32768 49152 65536 98304 131072 --output OUTPUT.json
 
 # Figure 4: one point of the context/batch sweep per invocation.
 python -m torch.distributed.run --standalone --nproc-per-node=8 \
   -m benchmarks.memory --arm basis --model MODEL \
-  --value-factors FACTORS --router-dir PAGE32_ROUTER \
+  --value-factors FACTORS --router-dir PAGE4_ROUTER \
   --tokens TOKENS.safetensors --context 65536 --batch-size 8 --output OUTPUT.json
 ```
 

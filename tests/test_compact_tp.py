@@ -154,7 +154,7 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
     from vllm.config import CompilationConfig, DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.model_executor.model_loader.utils import get_model_architecture
 
-    overrides = dict(architectures=[architecture], basisserve_c1_factor_dir=str(factors), basisserve_c1_validation='sha256')
+    overrides = dict(architectures=[architecture], basiskv_c1_factor_dir=str(factors), basiskv_c1_validation='sha256')
     model_config = ModelConfig(model=str(model_dir), dtype='bfloat16', seed=0, hf_overrides=overrides)
     # As in benchmarks.tp, the model runs without torch.compile. vLLM's compiled CUDA operators (RoPE, RMSNorm,
     # SiLU) do not exist on CPU, so its own PyTorch-native implementations of them are selected.
@@ -184,7 +184,7 @@ def build_rank(model_dir, factors, architecture, group, references, chunked_pref
         if attention.boundary is None:
             attention.attn = reference
         else:
-            object.__setattr__(reference, '_basisserve_c1_output', attention.boundary)
+            object.__setattr__(reference, '_basiskv_c1_output', attention.boundary)
             references[group.rank_in_group, real.layer_name] = reference
     return model
 
